@@ -15,6 +15,9 @@ An affordable platform for small-scale electrosynthesis screening, enabled by an
 - Run electroanalysis UI with command: ```moles-electroanalysis```
   - Tabbed interface for **cyclic voltammetry (CV)**, **differential pulse voltammetry (DPV)**, and an **analysis** workspace for overlaying, offsetting, smoothing, and labelling saved voltammograms
 
+## More information
+Check the [MOLES wiki](https://github.com/rousseauxgroup-uoft/MOLES-platform/wiki/MOLES-Wiki-Home) for more information regarding potentiostat ordering, hardware components, and other useful knowledge!
+
 ### Running multiple apps at once
 MOLES apps can run in parallel on one machine: for example, an electrolysis experiment
 on boards A–H while someone else runs CVs on board I. Serial ports are only
