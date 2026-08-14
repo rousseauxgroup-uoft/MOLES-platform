@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moles"
+version = "0.1.0"
+description = "MOLES — Modular Open-source Laboratory for Electrochemistry Screening."
+authors = [
+    { name = "Benjamin Chiu" },
+]
+# Original potentiostat driver and core logic by Han Hao, Sergio Pablo-García, and Gun Deniz Akkoc.
+# See NOTICE for full attribution details.
+license = { text = "Apache 2.0" }
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "scipy",
+    "pyserial",
+    "PyQt5",
+    "pyqtgraph",
+    "opencv-python-headless",
+    "pandas",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+testing = [
+    "flake8>=4",
+    "mypy>=0",
+    "pytest>=7",
+    "pytest-cov>=3",
+    "tox>=3",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+moles = ["py.typed", "resources/*.csv", "resources/*.png"]
+
+[project.scripts]
+moles = "moles.ui.launcher.__main__:main"
+moles-electrolysis = "moles.ui.electrolysis.__main__:main"
+moles-electroanalysis = "moles.ui.electroanalysis.__main__:main"
+moles-onboard = "moles.ui.onboarding.__main__:main"
+moles-settings = "moles.ui.settings.__main__:main"
+
+[tool.flake8]
+max-line-length = 160

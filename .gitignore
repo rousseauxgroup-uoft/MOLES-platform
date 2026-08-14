@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+
+# Claude Code local state
+.claude/
+CLAUDE.md
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+bin/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+pyvenv.cfg
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+myenv/
+venv/
+env/
+ENV/
+.venv/
+poten_new/
+poten_old/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS X
+.DS_Store
+**/.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# STM32CubeIDE / firmware build artifacts
+# (the source under firmware/driver-master/ is tracked; build output is not)
+**/Debug/
+**/Release/
+.settings/
+*.o
+*.d
+*.su
+*.cyclo
+*.list
+*.map
+*.bak
+
+# Debugging artifacts
+dev/diagnostic_logs/
+
+# Experimental data — measurement output belongs in the lab's data store,
+# not in version control. The two exceptions are the small CV trace shipped
+# for the example plotter and the shipped calibration table.
+data/
+scripts/data/
+*.csv
+!examples/sample_data/*.csv
+!src/moles/resources/*.csv
