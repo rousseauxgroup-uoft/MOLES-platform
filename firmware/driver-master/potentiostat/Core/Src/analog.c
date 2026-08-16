@@ -11,6 +11,7 @@
 extern IWDG_HandleTypeDef hiwdg;
 extern ADC_HandleTypeDef hadc1, hadc3, hadc5;
 extern ADC_HandleTypeDef hdac1, hdac2, hdac3;
+extern uint8_t switch_val;
 
 extern stLedConfig LED_List[LEDS_NUMBER];
 
@@ -419,6 +420,66 @@ void Pstat_RunTime(void *argument)
 		//last resort for a wedged instrument.
 		HAL_IWDG_Refresh(&hiwdg);
 	}
+}
+
+uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
+                     uint8_t *out_buf, uint32_t *actual_duration_us)
+{
+	/* Close the CE switch and record WE_OUT raw ADC counts at a fixed pace,
+	 * timed by the CPU cycle counter. Used for the R_u step measurement: in
+	 * the instant after the switch closes the cell behaves like a plain
+	 * resistor, and this loop starts sampling within microseconds of that
+	 * instant — over the serial link the first reading lands one USB round
+	 * trip (~3 ms) later, past most of the transient at typical cell time
+	 * constants.
+	 *
+	 * Raw single conversions, deliberately: no oversampling, no auto-gain,
+	 * no calibration — the host converts counts with its own calibration,
+	 * and the gain is whatever the host set before the capture.
+	 *
+	 * On success the switch is LEFT CLOSED so the host can do its
+	 * spike-free disconnect; a wedged ADC conversion opens it here (raw,
+	 * fail-safe) and returns the samples captured so far. */
+	uint16_t *out = (uint16_t *)out_buf;
+	uint16_t *p_src = &adc_buf[eANCH_WEOUT][1][0];
+	uint32_t captured = 0;
+
+	/* The cycle counter is free-running only while enabled; enabling is
+	 * idempotent and survives being already on under a debugger. */
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+	uint32_t cyc_per_us = SystemCoreClock / 1000000U;
+	uint32_t period_cyc = period_us * cyc_per_us;
+	uint32_t conv_cap_cyc = 2000U * cyc_per_us; /* a conversion takes ~us; 2 ms means wedged */
+
+	uint32_t t0 = DWT->CYCCNT;
+	HAL_GPIO_WritePin(CE_EN_GPIO_Port, CE_EN_Pin, GPIO_PIN_SET);
+	switch_val = eSWITCH_ON;
+
+	for (uint32_t i = 0; i < n_samples; i++){
+		uint32_t due = t0 + (i * period_cyc);
+		while ((int32_t)(DWT->CYCCNT - due) < 0) {}
+		completed_ch_count = 0;
+		HAL_ADC_Start_DMA((ADC_HandleTypeDef *)p_adc_ins[eANCH_WEOUT],
+				(uint32_t *)p_src, adc_ch_qty[eANCH_WEOUT]);
+		uint32_t conv_t0 = DWT->CYCCNT;
+		while (*(volatile uint8_t *)&completed_ch_count < 1) {
+			if ((DWT->CYCCNT - conv_t0) > conv_cap_cyc) {
+				HAL_GPIO_WritePin(CE_EN_GPIO_Port, CE_EN_Pin, GPIO_PIN_RESET);
+				switch_val = eSWITCH_OFF;
+				*actual_duration_us = (DWT->CYCCNT - t0) / cyc_per_us;
+				return captured;
+			}
+		}
+		out[captured++] = *p_src;
+		/* Deliberate foreground work, not a hang: keep the watchdog fed the
+		 * way the main loop does. The bounded conversion wait above keeps a
+		 * genuine wedge inside the watchdog's reach. */
+		HAL_IWDG_Refresh(&hiwdg);
+	}
+	*actual_duration_us = (DWT->CYCCNT - t0) / cyc_per_us;
+	return captured;
 }
 
 int32_t CurrentHoldStep(){

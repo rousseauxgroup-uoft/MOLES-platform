@@ -1,16 +1,18 @@
-"""A multichannel control tab for one voltammetry method (CV or DPV).
+"""A multichannel control tab for one electroanalysis method (CV, DPV, or OCP).
 
 Shows a scrollable column of per-potentiostat control panels on the left and a
 grid of live plots on the right — one plot per device, mirroring the layout of
 the electrolysis interface so several channels can be watched at once.
 
-The same class powers both the CV and the DPV tab; the ``method`` argument
-selects which parameter form the panels show and how data is plotted. A CV plots
+The same class powers the CV, DPV, and OCP tabs; the ``method`` argument selects
+which parameter form the panels show and how data is plotted. A CV plots
 measured current against measured potential directly. A DPV cannot: its potential
 jumps forward and back with every pulse, so plotting current against it just
 scribbles. Instead the DPV live plot transforms the accumulated raw stream on the
 fly — into the differential curve (delta-i vs step potential, built up one pulse
-period at a time), or the raw current against time for acquisition debugging.
+period at a time), or the raw current against time for acquisition debugging. An
+OCP run streams (time, potential) pairs, which plot directly as the resting
+potential against time.
 """
 
 from datetime import datetime
@@ -25,7 +27,7 @@ from ...methods.dpv import process_dpv
 from ...settings import get_cv_data_folder
 from ..scrollable_plots import PlotScrollArea, apply_scroll_height
 from .widgets import PotentiostatPanel
-from .workers import DPV_SAMPLE_HZ, VoltammetryWorker
+from .workers import DPV_SAMPLE_HZ, RuWorker, VoltammetryWorker
 
 
 def _potentials_beyond_compliance(params):
@@ -36,6 +38,8 @@ def _potentials_beyond_compliance(params):
     points sit beyond the plain sweep limits) and returns those beyond the
     warning threshold.
     """
+    if params.get('method') == 'OCP':
+        return []  # nothing is driven: the cell stays disconnected throughout
     if params.get('method') == 'DPV':
         pulse = abs(params.get('pulse_V', 0.0))
         if params.get('dpv_type') == 'cyclic':
@@ -253,14 +257,29 @@ class ControlTab(QtWidgets.QWidget):
         panel.smoothing_changed.connect(self.update_smoothing)
         panel.live_view_changed.connect(self.update_live_view)
         panel.stop_requested.connect(self.stop_experiment)
+        panel.measure_ru_requested.connect(self.measure_r_u)
         self._panel_layout.insertWidget(self._panel_layout.count() - 1, panel)
         self._panels[pid] = panel
+
+    def _default_labels(self):
+        """Return this method's ``((x_text, x_units), (y_text, y_units))``.
+
+        A voltammogram plots current against potential; an OCP run plots the
+        resting potential against time. The time unit is carried in the label
+        text rather than passed as an axis unit on purpose: pyqtgraph rescales
+        a unit-bearing axis with SI prefixes, which would turn an hour-long run
+        into "3.6 ks" instead of counting seconds.
+        """
+        if self.method == 'OCP':
+            return ('Time (s)', None), ('Potential', 'V')
+        return ('Potential', 'V'), ('Current', 'uA')
 
     def _add_plot(self, pid, idx):
         r, c = idx // 2, idx % 2
         p = self.plot_win.addPlot(row=r, col=c, title=f"PS {pid}")
-        p.setLabel('left', 'Current', units='uA')
-        p.setLabel('bottom', 'Potential', units='V')
+        (xtext, xunits), (ytext, yunits) = self._default_labels()
+        p.setLabel('left', ytext, units=yunits)
+        p.setLabel('bottom', xtext, units=xunits)
         p.showGrid(x=True, y=True)
         p.addLegend()
 
@@ -269,8 +288,8 @@ class ControlTab(QtWidgets.QWidget):
         smooth = p.plot([], [], pen=pen_smooth, name="Smoothed")
 
         self._plots[pid] = {'plot': p, 'raw': raw, 'smooth': smooth}
-        self._ylabels[pid] = ('Current', 'uA')
-        self._xlabels[pid] = ('Potential', 'V')
+        self._ylabels[pid] = (ytext, yunits)
+        self._xlabels[pid] = (xtext, xunits)
         self._dpv_view[pid] = 'differential'
         self._live_data[pid] = self._empty_live_data()
 
@@ -327,8 +346,9 @@ class ControlTab(QtWidgets.QWidget):
             if self.method == 'DPV':
                 self._apply_dpv_labels(pot_id)
             else:
-                self._set_left_label(pot_id, 'Current', 'uA')
-                self._set_bottom_label(pot_id, 'Potential', 'V')
+                (xtext, xunits), (ytext, yunits) = self._default_labels()
+                self._set_left_label(pot_id, ytext, units=yunits)
+                self._set_bottom_label(pot_id, xtext, units=xunits)
 
         worker = VoltammetryWorker(
             pot_id, port, params, use_mock=self.test_mode_cb.isChecked()
@@ -341,6 +361,39 @@ class ControlTab(QtWidgets.QWidget):
         QtCore.QThreadPool.globalInstance().start(worker)
         if not self._plot_timer.isActive():
             self._plot_timer.start()
+
+    def measure_r_u(self, pot_id):
+        """Measure this board's solution resistance and fill it into the form."""
+        if pot_id in self._active_workers:
+            self._panels[pot_id].update_status("Busy — experiment running.")
+            return
+
+        ports = self._current_ports()
+        port = ports.get(pot_id)
+        if not port:
+            self._panels[pot_id].update_status("Error: Port not found")
+            return
+
+        panel = self._panels[pot_id]
+        panel.set_measuring_ru(True)
+
+        worker = RuWorker(pot_id, port, use_mock=self.test_mode_cb.isChecked())
+        worker.signals.status.connect(panel.update_status)
+        worker.signals.finished.connect(self._on_r_u_measured)
+        QtCore.QThreadPool.globalInstance().start(worker)
+
+    def _on_r_u_measured(self, pot_id, success, msg, r_u):
+        """Fill in a measured R_u, or report why the measurement failed."""
+        panel = self._panels.get(pot_id)
+        if panel is None:
+            return
+        panel.set_measuring_ru(False)
+
+        if success and r_u is not None:
+            panel.set_measured_r_u(r_u)
+            panel.update_status(f"Done — {msg}")
+        else:
+            panel.update_status(f"Error: {msg}")
 
     def stop_experiment(self, pot_id):
         """Forward a stop request to the running worker for this device.
@@ -414,8 +467,9 @@ class ControlTab(QtWidgets.QWidget):
     def _live_xy(self, pid, v, i):
         """Turn one channel's accumulated raw stream into the (x, y) to plot.
 
-        CV plots measured current against measured potential directly, so the
-        raw arrays pass straight through. DPV cannot — its potential jumps with
+        CV plots measured current against measured potential directly, and an
+        OCP run already streams (time, potential), so in both cases the arrays
+        pass straight through. DPV cannot — its potential jumps with
         every pulse — so the raw stream is transformed into the selected live
         view: the differential curve (delta-i vs step potential, recomputed from
         every complete pulse period so far) or the raw current against time.
@@ -579,8 +633,9 @@ class ControlTab(QtWidgets.QWidget):
         plot_w = pg.PlotWidget()
         plot_w.setBackground('w')
         p = plot_w.getPlotItem()
-        ytext, yunits = self._ylabels.get(pid, ('Current', 'uA'))
-        xtext, xunits = self._xlabels.get(pid, ('Potential', 'V'))
+        default_x, default_y = self._default_labels()
+        ytext, yunits = self._ylabels.get(pid, default_y)
+        xtext, xunits = self._xlabels.get(pid, default_x)
         p.setLabel('left', ytext, units=yunits)
         p.setLabel('bottom', xtext, units=xunits)
         p.showGrid(x=True, y=True)
@@ -634,7 +689,8 @@ class ControlTab(QtWidgets.QWidget):
             window = self._panels[pot_id].smooth_spin.value()
             self._render_curves(pot_id, x, y, window)
         else:
-            # CV: sync the plot to the final calibrated trace.
+            # CV / OCP: sync the plot to the final saved trace — (potential,
+            # current) for a CV, (time, potential) for an OCP run.
             v, i = np.asarray(result['raw_v'], dtype=float), np.asarray(result['raw_i'], dtype=float)
             self._live_data[pot_id] = {'v': v, 'i': i, 'v_new': [], 'i_new': []}
             window = self._panels[pot_id].smooth_spin.value()
@@ -647,8 +703,10 @@ class ControlTab(QtWidgets.QWidget):
         """Offer to save whatever data was streamed before an early stop.
 
         For DPV this is the raw staircase (a clean differential curve needs the
-        full sweep), so the partial file is always saved as plain
-        potential/current pairs.
+        full sweep), so the partial file is saved as plain potential/current
+        pairs. An OCP run streams (time, potential) instead, and stopping it
+        early simply means a shorter — but complete — trace, so its partial
+        file has exactly the layout a full OCP file does.
         """
         data = self._live_data.get(pot_id, self._empty_live_data())
         v_data, i_data = self._merged_arrays(data)
@@ -670,9 +728,11 @@ class ControlTab(QtWidgets.QWidget):
         name = self._panels[pot_id].get_params().get('name', 'Experiment')
         filename = data_folder / f"{name}_PS-{pot_id}_{timestamp}_PARTIAL.csv"
 
+        header = ("Time (s),Potential (V)" if self.method == 'OCP'
+                  else "Potential (V),Current (uA)")
         np.savetxt(
             filename, np.column_stack([v_data, i_data]), delimiter=",",
-            header="Potential (V),Current (uA)", comments='', fmt='%.5f',
+            header=header, comments='', fmt='%.5f',
         )
         QtWidgets.QMessageBox.information(
             self, "Partial Data Saved",

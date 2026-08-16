@@ -22,6 +22,7 @@ moles-electroanalysis  # for cyclic voltammetry, differential pulse, and analysi
 | `diagnose_usb_capture.py` | Offline analyzer for a Wireshark/USBPcap `.pcapng` capture of the USB traffic. Reports where the data stream stops, bus errors, re-enumeration, whether the *host* stopped reading (canceled read pump), and how far the host app fell behind the device (backlog + loop-rate history). No hardware needed; reads a saved capture. |
 | `repro_stall_cv.py` | **Hardware-facing.** Reproduces the extended-CV USB failure on demand by injecting a deliberate reader stall mid-CV. Use with a dummy cell, capture with USBPcap, and compare before/after firmware fixes. Never run automatically. |
 | `verify_ac_math.py` | Standalone sanity check on the alternating-current waveform math (peak currents, frequency, duty cycle). No hardware needed. |
+| `verify_R_u.py` | **Hardware-facing.** Validates `measure_R_u` against a resistor of known value wired as a dummy cell. Sweeps step sizes, repeats each, and reports the measured resistance three ways so noise bias is visible. Never run automatically. |
 
 ## The extended-CV failure signature (July 2026)
 

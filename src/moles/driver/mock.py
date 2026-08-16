@@ -226,6 +226,28 @@ class MockPotentiostat:
             self._present_current_mA() + np.random.normal(0, 0.005),
         ]
 
+    def measure_R_u(self, step_mV=50.0, n_readings=30, settle_s=2.0):
+        """Synthetic R_u measurement matching the real driver's return shape.
+
+        Reports the mock cell's own series resistance, with a little scatter so
+        repeated measurements are not suspiciously identical.
+        """
+        self._maybe_timeout()
+        step_V = step_mV / 1000.0
+        R_u = self._base_resistance * (1.0 + np.random.normal(0, 0.01))
+        I_peak_A = step_V / R_u
+        currents_A = I_peak_A * (1.0 + np.random.normal(0, 0.01, n_readings))
+        return {
+            'R_u_ohm': float(abs(step_V / currents_A[np.argmax(np.abs(currents_A))])),
+            'fit_ok': True,
+            'message': '',
+            'polarities': [],
+            'step_V': step_V,
+            'I_peak_A': float(currents_A[0]),
+            'times_ms': np.arange(n_readings, dtype=float) * 6.0,
+            'currents_A': currents_A,
+        }
+
     def write_voltage_batch(self, voltages, delay):
         """Simulate the firmware batch protocol used by alternating polarity.
 
@@ -339,6 +361,9 @@ class MockLivePotentiostat:
         self._switch_state = False
         # Synthetic redox couple the fake chemistry is centred on.
         self._redox_E = 0.20  # V
+        # When the fake cell was first left at open circuit, so its resting
+        # potential can relax with time (see _synth_ocp).
+        self._ocp_t0 = None
 
     # --- Connection / configuration no-ops (match the real interface) ---
 
@@ -362,7 +387,28 @@ class MockLivePotentiostat:
         return self._auto_gain
 
     def read_ocp(self, restore_switch_state=True):
-        return float(np.random.normal(0.0, 0.005))
+        """Disconnect the fake cell and report its resting potential."""
+        self._switch_state = False
+        return self._synth_ocp()
+
+    def read_potential_calibrated(self):
+        """Sensed WE-RE potential, in the array shape the real driver returns.
+
+        With the switch open this is the open-circuit potential, which is how
+        the OCP monitor samples it once the cell has been disconnected.
+        """
+        return np.array([self._synth_ocp()])
+
+    def _synth_ocp(self):
+        """Fake resting potential: an exponential relaxation toward a settled
+        value, plus noise, so a Test Mode OCP trace drifts and levels off the
+        way a cell equilibrating in solution does."""
+        if self._ocp_t0 is None:
+            self._ocp_t0 = time.monotonic()
+        elapsed = time.monotonic() - self._ocp_t0
+        settled_V = self._redox_E - 0.15
+        return float(settled_V + 0.12 * np.exp(-elapsed / 20.0)
+                     + np.random.normal(0, 0.002))
 
     def set_calibration_params(self, slope, intercept, read_slope=None, read_intercept=None):
         pass
@@ -393,14 +439,12 @@ class MockLivePotentiostat:
 
     # --- Synthetic experiments ---
 
-    def perform_CV(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None,
-                   last_V=None, scan_direction='Negative'):
-        """Generate and stream a synthetic cyclic voltammogram.
+    def _synth_cv(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None,
+                  last_V=None, scan_direction='Negative'):
+        """Build the synthetic sweep and its fake current response.
 
-        Builds the same triangular potential sweep the real driver would, then
-        fakes a current response: a capacitive baseline plus an oxidation peak
-        on the forward sweep and a reduction peak on the reverse, so the trace
-        has the familiar "duck" shape.
+        Shared by perform_CV and perform_CV_iR. Returns
+        ``(applied, measured_V, current_uA)``.
         """
         if start_V is None:
             start_V = 0.0
@@ -442,6 +486,20 @@ class MockLivePotentiostat:
         noise = np.random.normal(0, 0.03, n)
         current_uA = cap + ox + red + noise
         measured_V = applied + np.random.normal(0, 0.002, n)
+        return applied, measured_V, current_uA
+
+    def perform_CV(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None,
+                   last_V=None, scan_direction='Negative'):
+        """Generate and stream a synthetic cyclic voltammogram.
+
+        Builds the same triangular potential sweep the real driver would, then
+        fakes a current response: a capacitive baseline plus an oxidation peak
+        on the forward sweep and a reduction peak on the reverse, so the trace
+        has the familiar "duck" shape.
+        """
+        applied, measured_V, current_uA = self._synth_cv(
+            min_V, max_V, cycles, mV_s, step_hz, start_V, last_V, scan_direction)
+        n = len(applied)
 
         self._stream(measured_V, current_uA)
 
@@ -453,6 +511,84 @@ class MockLivePotentiostat:
             cycle_nums[c * cycle_points:(c + 1) * cycle_points] = c
         return np.column_stack(
             (time_stamps, measured_V, current_uA, cycle_nums, np.zeros(n), applied)
+        )
+
+    def measure_R_u(self, step_mV=50.0, n_readings=30, settle_s=2.0):
+        """Synthetic R_u measurement, matching the real driver's return shape."""
+        step_V = step_mV / 1000.0
+        R_u = 150.0 * (1.0 + np.random.normal(0, 0.01))
+        currents_A = (step_V / R_u) * (1.0 + np.random.normal(0, 0.01, n_readings))
+        return {
+            'R_u_ohm': float(abs(step_V / currents_A[np.argmax(np.abs(currents_A))])),
+            'fit_ok': True,
+            'message': '',
+            'polarities': [],
+            'step_V': step_V,
+            'I_peak_A': float(currents_A[0]),
+            'times_ms': np.arange(n_readings, dtype=float) * 6.0,
+            'currents_A': currents_A,
+        }
+
+    def perform_CV_iR(self, min_V, max_V, cycles, mV_s, step_hz, R_u_ohm,
+                      start_V=None, last_V=None, scan_direction='Negative',
+                      compensation_fraction=0.7, max_consecutive_timeouts=5,
+                      data_callback=None, stop_event=None, callback_block=6,
+                      **_ignored_guards):
+        """Stream a synthetic iR-compensated voltammogram.
+
+        The synthetic sweep is treated as the potential the electrode itself
+        experiences, since that is what drives the chemistry. What the
+        instrument senses sits a full ohmic drop above it — the deliberately
+        overshooting value a real compensated run applies to get the electrode
+        there — so the caller has to subtract I*R_u to recover a readable
+        voltammogram, exactly as it must with real hardware.
+
+        The offset is physically consistent rather than exaggerated, so at the
+        mock's microamp currents a realistic R_u barely shows — enter a large
+        R_u (a few kilohms) to see the effect clearly in Test Mode.
+        ``compensation_fraction`` does not change this first-order model: it
+        governs how faithfully a real cell tracks the sweep, which a static
+        mock cannot reproduce.
+
+        Like the real driver, a stop returns the points completed so far
+        instead of raising.
+        """
+        applied, interfacial_V, current_uA = self._synth_cv(
+            min_V, max_V, cycles, mV_s, step_hz, start_V, last_V, scan_direction)
+        n = len(applied)
+
+        measured_V = interfacial_V + (current_uA * 1e-6) * R_u_ohm
+
+        cb = data_callback if data_callback is not None else self.data_callback
+        ev = stop_event if stop_event is not None else self.stop_event
+
+        points_done = n
+        for i in range(0, n, callback_block):
+            if ev is not None and ev.is_set():
+                points_done = i
+                break
+            upto = min(i + callback_block, n)
+            if cb:
+                cb(np.round(measured_V[i:upto], 5), np.round(current_uA[i:upto], 5))
+            if self.chunk_delay_s:
+                time.sleep(self.chunk_delay_s)
+
+        applied = applied[:points_done]
+        measured_V = measured_V[:points_done]
+        current_uA = current_uA[:points_done]
+
+        duration_s = points_done / step_hz
+        time_stamps = np.linspace(0, duration_s, points_done)
+        cycle_points = max(1, n // max(cycles, 1))
+        cycle_nums = np.zeros(points_done)
+        for c in range(cycles):
+            start = c * cycle_points
+            if start >= points_done:
+                break
+            cycle_nums[start:min((c + 1) * cycle_points, points_done)] = c
+        return np.column_stack(
+            (time_stamps, measured_V, current_uA, cycle_nums,
+             np.zeros(points_done), applied)
         )
 
     def perform_DPV(self, waveform, start_V, sample_hz):

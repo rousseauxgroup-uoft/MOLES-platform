@@ -193,6 +193,8 @@ void Update_ADC_Readings(uint8_t *channels,uint8_t channel_cnt);
 float Set_TIA_Gain(eTIA_GAIN gain);
 void Pstat_RunTime(void *argument);
 int32_t CurrentHoldStep();
+uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
+                     uint8_t *out_buf, uint32_t *actual_duration_us);
 
 const extern st_DAC_Chn dac_ch_cfg[];
 

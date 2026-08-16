@@ -1,12 +1,19 @@
-"""Offline analysis workspace for comparing saved voltammograms.
+"""Offline analysis workspace for comparing saved electroanalysis traces.
 
-The Analysis tab overlays several loaded traces on one plot so they can be
-compared directly. Each trace gets a row of controls:
+The Analysis tab overlays several loaded traces so they can be compared
+directly. Two kinds of trace are handled, on two separate plots, because they
+are read against different axes: voltammograms (current against potential, from
+CV and DPV) and OCP traces (resting potential against time). A plot appears
+only once something of its kind has been loaded.
+
+Each trace gets a row of controls, whichever kind it is:
 
 * **Offset (V)** — shift the potential axis, e.g. to reference against an
-  internal standard such as ferrocene.
+  internal standard such as ferrocene. Potential is the x-axis of a
+  voltammogram and the y-axis of an OCP trace, so the offset follows it.
 * **Colour** — pick the trace colour.
-* **Smoothing** — moving-average window applied to the current.
+* **Smoothing** — moving-average window applied to the measured signal (the
+  current of a voltammogram, the potential of an OCP trace).
 * **Data range** — a two-handle slider that plots only a slice of the trace.
 * **Show / Remove** — toggle visibility or drop the trace entirely.
 * **Save edited CSV** — write the currently displayed data (selected range,
@@ -14,8 +21,8 @@ compared directly. Each trace gets a row of controls:
   a small ``.edits.txt`` note recording those settings. The original file is
   left untouched and the new file is labelled ``_edited``.
 
-Double-clicking on the plot drops a labelled marker at that point; double-
-clicking an existing marker removes it — handy for annotating peak positions.
+Double-clicking on either plot drops a labelled marker at that point; double-
+clicking an existing marker removes it.
 """
 
 from pathlib import Path
@@ -24,7 +31,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from .loader import load_voltammogram
+from .loader import KIND_OCP, KIND_VOLTAMMOGRAM, load_trace
 from .range_slider import RangeSlider
 
 # Colours handed out to new traces in turn.
@@ -39,22 +46,30 @@ _LABEL_HIT_RADIUS_PX = 16
 
 
 class DatasetRow(QtWidgets.QGroupBox):
-    """One loaded trace plus its display controls."""
+    """One loaded trace plus its display controls.
+
+    ``x``/``y`` are whatever the trace's kind plots: potential and current for
+    a voltammogram, time and potential for an OCP trace. The labels are the
+    column names they came in with, reused when an edited copy is exported.
+    """
 
     changed = QtCore.pyqtSignal(int)           # dataset id
     remove_requested = QtCore.pyqtSignal(int)  # dataset id
 
-    def __init__(self, dataset_id, name, potential, current, color,
-                 label='Current (uA)', source_path=None):
+    def __init__(self, dataset_id, name, x, y, color,
+                 y_label='Current (uA)', x_label='Potential (V)',
+                 kind=KIND_VOLTAMMOGRAM, source_path=None):
         super().__init__()
         self.dataset_id = dataset_id
         self.name = name
-        self.potential = np.asarray(potential, dtype=float)
-        self.current = np.asarray(current, dtype=float)
+        self.x = np.asarray(x, dtype=float)
+        self.y = np.asarray(y, dtype=float)
         self.color = QtGui.QColor(color)
-        # Column header for the current values and the file this trace came
-        # from — both used when exporting an edited copy of the data.
-        self.label = label
+        # Column headers and the file this trace came from — all used when
+        # exporting an edited copy of the data.
+        self.x_label = x_label
+        self.y_label = y_label
+        self.kind = kind
         self.source_path = source_path
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -89,6 +104,10 @@ class DatasetRow(QtWidgets.QGroupBox):
         self.offset_spin.setRange(-10, 10)
         self.offset_spin.setSingleStep(0.01)
         self.offset_spin.setDecimals(3)
+        self.offset_spin.setToolTip(
+            "Shift the potential axis, e.g. to reference against an internal "
+            "standard."
+        )
         self.offset_spin.valueChanged.connect(self._emit_changed)
         row1.addWidget(self.offset_spin)
 
@@ -113,7 +132,7 @@ class DatasetRow(QtWidgets.QGroupBox):
 
         # Data range slider.
         layout.addWidget(QtWidgets.QLabel("Data range:"))
-        self.range_slider = RangeSlider(0, max(1, len(self.potential) - 1))
+        self.range_slider = RangeSlider(0, max(1, len(self.x) - 1))
         self.range_slider.rangeChanged.connect(lambda lo, hi: self._emit_changed())
         layout.addWidget(self.range_slider)
 
@@ -141,26 +160,39 @@ class DatasetRow(QtWidgets.QGroupBox):
             f"background-color: {self.color.name()}; border: 1px solid #888;"
         )
 
+    def _potential_is_y(self):
+        """True when potential is this trace's y-axis (an OCP time series)."""
+        return self.kind == KIND_OCP
+
     def _edited_arrays(self):
-        """Return the ``(potential, current)`` arrays exactly as drawn on the
-        plot — offset, smoothing, and the selected data range all applied.
-        Visibility is ignored so a hidden trace can still be exported."""
-        potential = self.potential - self.offset_spin.value()
-        current = self.current
+        """Return the ``(x, y)`` arrays exactly as drawn on the plot — offset,
+        smoothing, and the selected data range all applied. Visibility is
+        ignored so a hidden trace can still be exported.
+
+        The offset references the potential axis, which is x on a voltammogram
+        and y on an OCP trace; smoothing always applies to the measured signal
+        on y.
+        """
+        x, y = self.x, self.y
+        offset = self.offset_spin.value()
+        if self._potential_is_y():
+            y = y - offset
+        else:
+            x = x - offset
 
         window = self.smooth_spin.value()
-        if window > 1 and len(current) > window:
+        if window > 1 and len(y) > window:
             kernel = np.ones(window) / window
-            current = np.convolve(current, kernel, mode='same')
+            y = np.convolve(y, kernel, mode='same')
 
         low, high = self.range_slider.values()
         sl = slice(low, high + 1)
-        return potential[sl], current[sl]
+        return x[sl], y[sl]
 
     def rendered_data(self):
-        """Return the ``(potential, current)`` arrays to plot, after applying
-        offset, smoothing, and the selected data range. Returns ``None`` when
-        the trace is hidden."""
+        """Return the ``(x, y)`` arrays to plot, after applying offset,
+        smoothing, and the selected data range. Returns ``None`` when the
+        trace is hidden."""
         if not self.visible_cb.isChecked():
             return None
         return self._edited_arrays()
@@ -174,34 +206,35 @@ class DatasetRow(QtWidgets.QGroupBox):
         Raises ``ValueError`` if the selected range is empty or if ``path`` is
         the file this trace was loaded from (the original must stay untouched).
         """
-        potential, current = self._edited_arrays()
-        if len(potential) == 0:
+        x, y = self._edited_arrays()
+        if len(x) == 0:
             raise ValueError("The selected data range is empty.")
         if self.source_path is not None and \
                 Path(path).resolve() == Path(self.source_path).resolve():
             raise ValueError("Refusing to overwrite the original file.")
         np.savetxt(
-            path, np.column_stack([potential, current]), delimiter=",",
-            header=f"Potential (V),{self.label}", comments='', fmt='%.5f',
+            path, np.column_stack([x, y]), delimiter=",",
+            header=f"{self.x_label},{self.y_label}", comments='', fmt='%.5f',
         )
-        self._write_edit_notes(Path(path).with_suffix('.edits.txt'), potential)
-        return len(potential)
+        self._write_edit_notes(Path(path).with_suffix('.edits.txt'), x, y)
+        return len(x)
 
-    def _write_edit_notes(self, notes_path, exported_potential):
+    def _write_edit_notes(self, notes_path, exported_x, exported_y):
         """Write a plain-text note describing which edits produced the CSV:
         the source file, offset, smoothing window, and selected point range."""
         low, high = self.range_slider.values()
-        last_index = max(0, len(self.potential) - 1)
+        last_index = max(0, len(self.x) - 1)
         source = Path(self.source_path).name if self.source_path else "(unsaved trace)"
+        potential = exported_y if self._potential_is_y() else exported_x
         lines = [
             f"Edited copy of: {source}",
             f"Trace name: {self.name}",
             f"Offset applied (V): {self.offset_spin.value():.3f}",
             f"Smoothing (moving-average window, points): {self.smooth_spin.value()}",
             f"Selected point range (indices): {low} to {high} of 0 to {last_index}",
-            f"Points exported: {len(exported_potential)}",
+            f"Points exported: {len(exported_x)}",
             "Potential window after offset (V): "
-            f"{exported_potential.min():.3f} to {exported_potential.max():.3f}",
+            f"{potential.min():.3f} to {potential.max():.3f}",
         ]
         with open(notes_path, 'w') as f:
             f.write("\n".join(lines) + "\n")
@@ -239,13 +272,14 @@ class DatasetRow(QtWidgets.QGroupBox):
 
 
 class AnalysisTab(QtWidgets.QWidget):
-    """Tab for overlaying and annotating saved voltammograms."""
+    """Tab for overlaying and annotating saved traces of either kind."""
 
     def __init__(self):
         super().__init__()
         self._rows = {}          # dataset id → DatasetRow
         self._curves = {}        # dataset id → PlotDataItem
-        self._peak_labels = []   # list of {'x', 'y', 'text', 'marker'}
+        self._curve_plots = {}   # dataset id → the PlotWidget it was drawn on
+        self._peak_labels = []   # list of {'x', 'y', 'text', 'marker', 'plot'}
         self._next_id = 0
         self._color_index = 0
 
@@ -267,7 +301,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.add_btn.clicked.connect(self.add_files)
         left_layout.addWidget(self.add_btn)
 
-        hint = QtWidgets.QLabel("Double-click the plot to label a peak;\n"
+        hint = QtWidgets.QLabel("Double-click a plot to label a point;\n"
                                 "double-click a label to remove it.")
         hint.setStyleSheet("color: gray; font-size: 11px;")
         left_layout.addWidget(hint)
@@ -280,7 +314,11 @@ class AnalysisTab(QtWidgets.QWidget):
         scroll.setWidget(self._row_container)
         left_layout.addWidget(scroll)
 
-        # --- Right: overlay plot ---
+        # --- Right: one overlay plot per kind of trace ---
+        # Current-vs-potential and potential-vs-time cannot share axes, so they
+        # get a plot each, stacked. Each is shown only once a trace of its kind
+        # is loaded; with nothing loaded the voltammogram plot stands as the
+        # empty state.
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w')
         self.plot_widget.setLabel('left', 'Current', units='uA')
@@ -294,11 +332,34 @@ class AnalysisTab(QtWidgets.QWidget):
         # computed from the average x-spacing, which collapses to ~zero and can
         # silently drop the entire trace. CV traces are small, so we render them
         # at full resolution instead.
-        self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
+
+        self.ocp_plot_widget = pg.PlotWidget()
+        self.ocp_plot_widget.setBackground('w')
+        self.ocp_plot_widget.setLabel('left', 'Potential', units='V')
+        # The time unit lives in the label text rather than being passed as an
+        # axis unit: pyqtgraph SI-rescales a unit-bearing axis, which would
+        # report an hour-long run as "3.6 ks" instead of counting seconds.
+        self.ocp_plot_widget.setLabel('bottom', 'Time (s)')
+        self.ocp_plot_widget.showGrid(x=True, y=True)
+        self.ocp_plot_widget.addLegend()
+        # Safe here, unlike above: an OCP trace's x-axis is elapsed time, which
+        # does increase uniformly, so hour-long runs can be thinned for display.
+        self.ocp_plot_widget.setDownsampling(auto=True, mode='peak')
+        self.ocp_plot_widget.setClipToView(True)
+        self.ocp_plot_widget.setVisible(False)
+
+        for widget in (self.plot_widget, self.ocp_plot_widget):
+            widget.scene().sigMouseClicked.connect(
+                lambda event, w=widget: self._on_plot_clicked(event, w)
+            )
+
+        plot_panel = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        plot_panel.addWidget(self.plot_widget)
+        plot_panel.addWidget(self.ocp_plot_widget)
 
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(left_panel)
-        splitter.addWidget(self.plot_widget)
+        splitter.addWidget(plot_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([380, 820])
@@ -311,7 +372,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def add_files(self):
         """Prompt for CSV files and add each as a new trace."""
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Select voltammogram CSV file(s)", "", "CSV files (*.csv)"
+            self, "Select electroanalysis CSV file(s)", "", "CSV files (*.csv)"
         )
         for path in paths:
             self.add_dataset_from_file(path)
@@ -319,35 +380,60 @@ class AnalysisTab(QtWidgets.QWidget):
     def add_dataset_from_file(self, path):
         """Load a CSV and add it as a trace, reporting failures inline."""
         try:
-            potential, current, label = load_voltammogram(path)
+            trace = load_trace(path)
         except Exception as e:
             QtWidgets.QMessageBox.warning(
                 self, "Could Not Load File",
                 f"Failed to load {Path(path).name}:\n{e}",
             )
             return
-        self.add_dataset(Path(path).stem, potential, current, label,
+        self.add_dataset(Path(path).stem, trace.x, trace.y, trace.y_label,
+                         x_label=trace.x_label, kind=trace.kind,
                          source_path=path)
 
-    def add_dataset(self, name, potential, current, label='Current (uA)',
+    def add_dataset(self, name, x, y, y_label='Current (uA)',
+                    x_label='Potential (V)', kind=KIND_VOLTAMMOGRAM,
                     source_path=None):
-        """Create a trace, its control row, and its plot curve."""
+        """Create a trace, its control row, and its plot curve.
+
+        The curve goes on the plot for its ``kind``, which is revealed if this
+        is the first trace of that kind.
+        """
         dataset_id = self._next_id
         self._next_id += 1
         color = _COLOR_CYCLE[self._color_index % len(_COLOR_CYCLE)]
         self._color_index += 1
 
-        row = DatasetRow(dataset_id, name, potential, current, color,
-                         label=label, source_path=source_path)
+        row = DatasetRow(dataset_id, name, x, y, color, y_label=y_label,
+                         x_label=x_label, kind=kind, source_path=source_path)
         row.changed.connect(self._schedule_render)
         row.remove_requested.connect(self._remove_dataset)
         self._row_layout.insertWidget(self._row_layout.count() - 1, row)
         self._rows[dataset_id] = row
 
-        curve = self.plot_widget.plot([], [], name=name)
+        plot = self._plot_for(kind)
+        curve = plot.plot([], [], name=name)
         self._curves[dataset_id] = curve
+        self._curve_plots[dataset_id] = plot
 
+        self._update_plot_visibility()
         self._render_dataset(dataset_id)
+
+    def _plot_for(self, kind):
+        """Return the plot widget a trace of this kind belongs on."""
+        return self.ocp_plot_widget if kind == KIND_OCP else self.plot_widget
+
+    def _update_plot_visibility(self):
+        """Show each plot only while it has traces on it.
+
+        With nothing loaded at all the voltammogram plot stays up as the empty
+        state, so the tab never shows a blank panel.
+        """
+        kinds = {row.kind for row in self._rows.values()}
+        has_ocp = KIND_OCP in kinds
+        has_voltammogram = KIND_VOLTAMMOGRAM in kinds
+        self.ocp_plot_widget.setVisible(has_ocp)
+        self.plot_widget.setVisible(has_voltammogram or not has_ocp)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -377,8 +463,8 @@ class AnalysisTab(QtWidgets.QWidget):
             curve.setData([], [])
             return
 
-        potential, current = rendered
-        curve.setData(potential, current)
+        x, y = rendered
+        curve.setData(x, y)
         curve.setPen(pg.mkPen(color=row.color, width=2))
 
     def _remove_dataset(self, dataset_id):
@@ -388,48 +474,60 @@ class AnalysisTab(QtWidgets.QWidget):
         if row is not None:
             row.setParent(None)
         curve = self._curves.pop(dataset_id, None)
+        plot = self._curve_plots.pop(dataset_id, self.plot_widget)
         if curve is not None:
-            self.plot_widget.removeItem(curve)
+            plot.removeItem(curve)
+        # Removing the last trace of a kind puts that plot away again.
+        self._update_plot_visibility()
 
     # ------------------------------------------------------------------
     # Peak labelling
     # ------------------------------------------------------------------
 
-    def _on_plot_clicked(self, event):
-        """Add a peak label on double-click, or remove one if clicked again."""
+    def _on_plot_clicked(self, event, plot):
+        """Add a label on double-click, or remove one if clicked again.
+
+        ``plot`` is the widget whose scene emitted the click, so a label only
+        ever matches against the markers on that same plot.
+        """
         if not event.double():
             return
-        vb = self.plot_widget.plotItem.vb
+        vb = plot.plotItem.vb
         scene_pos = event.scenePos()
-        if not self.plot_widget.sceneBoundingRect().contains(scene_pos):
+        if not plot.sceneBoundingRect().contains(scene_pos):
             return
 
         # If the click landed on an existing label, remove that label instead.
         for entry in self._peak_labels:
+            if entry['plot'] is not plot:
+                continue
             anchor_scene = vb.mapViewToScene(
                 QtCore.QPointF(entry['x'], entry['y'])
             )
             dx = anchor_scene.x() - scene_pos.x()
             dy = anchor_scene.y() - scene_pos.y()
             if (dx * dx + dy * dy) ** 0.5 <= _LABEL_HIT_RADIUS_PX:
-                self.plot_widget.removeItem(entry['text'])
-                self.plot_widget.removeItem(entry['marker'])
+                plot.removeItem(entry['text'])
+                plot.removeItem(entry['marker'])
                 self._peak_labels.remove(entry)
                 return
 
         data_pt = vb.mapSceneToView(scene_pos)
-        self._add_peak_label(data_pt.x(), data_pt.y())
+        self._add_peak_label(data_pt.x(), data_pt.y(), plot)
 
-    def _add_peak_label(self, x, y):
-        """Place a marker and coordinate label at a point on the plot."""
+    def _add_peak_label(self, x, y, plot=None):
+        """Place a marker and coordinate label at a point on a plot."""
+        if plot is None:
+            plot = self.plot_widget
         marker = pg.ScatterPlotItem(
             [x], [y], size=11, symbol='x',
             pen=pg.mkPen('k', width=2), brush=pg.mkBrush('k'),
         )
-        self.plot_widget.addItem(marker)
+        plot.addItem(marker)
 
         text = pg.TextItem(f"({x:.3f}, {y:.3f})", color='k', anchor=(0, 1))
         text.setPos(x, y)
-        self.plot_widget.addItem(text)
+        plot.addItem(text)
 
-        self._peak_labels.append({'x': x, 'y': y, 'text': text, 'marker': marker})
+        self._peak_labels.append(
+            {'x': x, 'y': y, 'text': text, 'marker': marker, 'plot': plot})

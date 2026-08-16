@@ -1,18 +1,27 @@
-"""Per-potentiostat parameter forms and control panel for the CV / DPV tabs.
+"""Per-potentiostat parameter forms and control panel for the CV / DPV / OCP tabs.
 
 Each electroanalysis tab shows one ``PotentiostatPanel`` per connected device.
-A panel wraps a method-specific parameter form (``CVConfigWidget`` or
-``DPVConfigWidget``), a smoothing control, and the Run / Stop buttons, and
-reports user actions back to its tab through Qt signals.
+A panel wraps a method-specific parameter form (``CVConfigWidget``,
+``DPVConfigWidget``, or ``OCPConfigWidget``), a smoothing control, and the
+Run / Stop buttons, and reports user actions back to its tab through Qt
+signals.
 """
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
+from .workers import IR_STEP_HZ
+
+# Step size above which an iR-compensated sweep is coarse enough to blur where
+# peaks sit, so the form warns about it.
+IR_COARSE_STEP_MV = 5.0
+
 
 class CVConfigWidget(QtWidgets.QWidget):
     """Form for entering cyclic voltammetry parameters."""
+
+    measure_ru_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -70,6 +79,111 @@ class CVConfigWidget(QtWidgets.QWidget):
         )
         layout.addRow("", self.auto_gain_cb)
 
+        # Solution resistance makes the electrode fall short of the potential
+        # asked for, which spreads peaks apart. Correcting for it is off by
+        # default, so an ordinary CV behaves exactly as before.
+        self.ir_box = QtWidgets.QGroupBox("iR compensation")
+        self.ir_box.setCheckable(True)
+        self.ir_box.setChecked(False)
+        self.ir_box.setToolTip(
+            "Correct for the potential lost to solution resistance.\n"
+            "Measure R_u first, then run."
+        )
+        ir_form = QtWidgets.QFormLayout(self.ir_box)
+
+        ru_row = QtWidgets.QHBoxLayout()
+        self.r_u = QtWidgets.QDoubleSpinBox()
+        self.r_u.setRange(0.0, 100000.0)
+        self.r_u.setDecimals(1)
+        self.r_u.setValue(0.0)
+        self.r_u.setSuffix(" Ω")
+        self.r_u.setToolTip("Uncompensated solution resistance between the "
+                            "reference and working electrodes.")
+        ru_row.addWidget(self.r_u)
+        self.measure_ru_btn = QtWidgets.QPushButton("Measure")
+        self.measure_ru_btn.setToolTip(
+            "Step the potential both ways from rest and fit the current "
+            "decay back to the instant of each step.\nTakes several seconds "
+            "and briefly energizes the cell."
+        )
+        self.measure_ru_btn.clicked.connect(self.measure_ru_requested.emit)
+        ru_row.addWidget(self.measure_ru_btn)
+        ir_form.addRow("R_u:", ru_row)
+
+        self.ir_mode = QtWidgets.QComboBox()
+        self.ir_mode.addItem("Post-hoc (simple correction)", 'posthoc')
+        self.ir_mode.addItem("Live feedback (advanced correction)", 'live')
+        self.ir_mode.setToolTip(
+            "Post-hoc: run a normal batched CV, then subtract I x R_u from "
+            "the potential axis.\nLive: overshoot each setpoint by the "
+            "measured ohmic drop while the scan runs. Slower, runs at fixed gain, "
+            "and less forgiving of a wrong R_u."
+        )
+        ir_form.addRow("Mode:", self.ir_mode)
+
+        self.ir_percent = QtWidgets.QSpinBox()
+        self.ir_percent.setRange(0, 100)
+        self.ir_percent.setValue(70)
+        self.ir_percent.setSuffix(" %")
+        self.ir_percent.setToolTip(
+            "Live mode only: how much of the ohmic drop to add back during "
+            "the scan.\nWell below 100% on purpose; the correction uses a "
+            "positive feedback loop, and high values can lead to " \
+            "unstable potentiostat output."
+        )
+        ir_form.addRow("Apply:", self.ir_percent)
+
+        self.ir_note = QtWidgets.QLabel()
+        self.ir_note.setWordWrap(True)
+        self.ir_note.setStyleSheet("color: gray; font-size: 11px;")
+        ir_form.addRow("", self.ir_note)
+
+        layout.addRow(self.ir_box)
+
+        self.scan_rate.valueChanged.connect(self._update_ir_note)
+        self.ir_box.toggled.connect(self._update_ir_note)
+        self.ir_mode.currentIndexChanged.connect(self._update_ir_note)
+        self._update_ir_note()
+
+    def _update_ir_note(self):
+        """Explain what the selected compensation mode does and does not fix.
+
+        Post-hoc corrects the recorded axis only, so the note says what that
+        is good for. Live mode sets and reads one point per serial round
+        trip, so its note shows the step size, which gets coarser as the
+        scan rate rises.
+        """
+        self.ir_percent.setEnabled(self.ir_mode.currentData() == 'live')
+        if not self.ir_box.isChecked():
+            self.ir_note.clear()
+            return
+        if self.ir_mode.currentData() == 'posthoc':
+            self.ir_note.setStyleSheet("color: gray; font-size: 11px;")
+            self.ir_note.setText(
+                "Normal scan, then the axis is corrected by the full I × R_u. "
+                "Corrects for peak positions and E½, but the electrode itself will still "
+                "feel the ohmic drop.")
+            return
+        step_mV = self.scan_rate.value() / IR_STEP_HZ
+        msg = (f"≈ {step_mV:.1f} mV steps at {IR_STEP_HZ:g} points/s, "
+               f"fixed gain.")
+        if step_mV > IR_COARSE_STEP_MV:
+            msg += (" Steps this coarse blur peak positions — lower the scan "
+                    "rate for quantitative work.")
+            self.ir_note.setStyleSheet("color: #b8860b; font-size: 11px;")
+        else:
+            self.ir_note.setStyleSheet("color: gray; font-size: 11px;")
+        self.ir_note.setText(msg)
+
+    def set_measured_r_u(self, value_ohm):
+        """Fill in a freshly measured R_u."""
+        self.r_u.setValue(float(value_ohm))
+
+    def set_measuring(self, busy): 
+        """Disable the Measure button while a measurement is in flight."""
+        self.measure_ru_btn.setEnabled(not busy)
+        self.measure_ru_btn.setText("Measuring..." if busy else "Measure")
+
     def get_params(self):
         """Return the CV experiment parameters as a dict."""
         return {
@@ -83,6 +197,10 @@ class CVConfigWidget(QtWidgets.QWidget):
             'cycles': self.cycles.value(),
             'mV_s': self.scan_rate.value(),
             'auto_gain': self.auto_gain_cb.isChecked(),
+            'ir_enabled': self.ir_box.isChecked(),
+            'ir_mode': self.ir_mode.currentData(),
+            'R_u_ohm': self.r_u.value(),
+            'compensation_fraction': self.ir_percent.value() / 100.0,
         }
 
 
@@ -449,17 +567,106 @@ class DPVConfigWidget(QtWidgets.QWidget):
         return params
 
 
+class OCPConfigWidget(QtWidgets.QWidget):
+    """Form for entering open-circuit potential monitoring parameters.
+
+    An OCP run drives nothing — it watches the potential the cell rests at with
+    the counter electrode disconnected — so the only choices are how long to
+    watch for and how often to take a reading.
+    """
+
+    # Duration units offered, with the multiplier that turns each into seconds.
+    _DURATION_UNITS = [("minutes", 60.0), ("seconds", 1.0), ("hours", 3600.0)]
+
+    def __init__(self):
+        super().__init__()
+        layout = QtWidgets.QFormLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.name_edit = QtWidgets.QLineEdit()
+        self.name_edit.setPlaceholderText("Scan name")
+        layout.addRow("Name:", self.name_edit)
+
+        duration_row = QtWidgets.QHBoxLayout()
+        self.duration = QtWidgets.QDoubleSpinBox()
+        self.duration.setRange(0.01, 10000.0)
+        self.duration.setDecimals(2)
+        self.duration.setValue(10.0)
+        self.duration.setToolTip(
+            "How long to monitor for. The run can be stopped early and the "
+            "data collected so far still saved."
+        )
+        duration_row.addWidget(self.duration)
+        self.duration_unit = QtWidgets.QComboBox()
+        for label, _ in self._DURATION_UNITS:
+            self.duration_unit.addItem(label)
+        duration_row.addWidget(self.duration_unit)
+        layout.addRow("Duration:", duration_row)
+
+        self.sample_hz = QtWidgets.QDoubleSpinBox()
+        self.sample_hz.setRange(0.1, 10.0)
+        self.sample_hz.setDecimals(1)
+        self.sample_hz.setSingleStep(0.5)
+        self.sample_hz.setValue(2.0)
+        self.sample_hz.setSuffix(" Hz")
+        self.sample_hz.setToolTip(
+            "Readings per second. An open-circuit potential drifts slowly, so "
+            "a couple of readings a second resolve it comfortably."
+        )
+        layout.addRow("Sample Rate:", self.sample_hz)
+
+        self.note = QtWidgets.QLabel()
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addRow("", self.note)
+
+        self.duration.valueChanged.connect(self._update_note)
+        self.duration_unit.currentIndexChanged.connect(self._update_note)
+        self.sample_hz.valueChanged.connect(self._update_note)
+        self._update_note()
+
+    def _duration_s(self):
+        """Return the entered duration converted to seconds."""
+        _, multiplier = self._DURATION_UNITS[self.duration_unit.currentIndex()]
+        return self.duration.value() * multiplier
+
+    def _update_note(self):
+        """Say what the run will produce, and that the cell stays disconnected."""
+        n_points = int(self._duration_s() * self.sample_hz.value()) + 1
+        self.note.setText(
+            f"≈ {n_points} readings. The counter electrode stays disconnected "
+            f"for the whole run, so no current is passed through the cell."
+        )
+
+    def get_params(self):
+        """Return the OCP monitoring parameters as a dict."""
+        return {
+            'method': 'OCP',
+            'name': self.name_edit.text() or "OCP",
+            'duration_s': self._duration_s(),
+            'sample_hz': self.sample_hz.value(),
+            # No current flows through a disconnected cell, so there is nothing
+            # for auto-gain to range on; a fixed gain keeps the link quiet.
+            'auto_gain': False,
+        }
+
+
 # Maps a method name to the form widget class used to configure it.
-_CONFIG_WIDGETS = {'CV': CVConfigWidget, 'DPV': DPVConfigWidget}
+_CONFIG_WIDGETS = {
+    'CV': CVConfigWidget,
+    'DPV': DPVConfigWidget,
+    'OCP': OCPConfigWidget,
+}
 
 
 class PotentiostatPanel(QtWidgets.QGroupBox):
-    """Control panel for one potentiostat within a CV or DPV tab."""
+    """Control panel for one potentiostat within a CV, DPV, or OCP tab."""
 
     run_requested = QtCore.pyqtSignal(str, object)   # pot_id, params dict
     smoothing_changed = QtCore.pyqtSignal(str, int)  # pot_id, window size
     live_view_changed = QtCore.pyqtSignal(str, str)  # pot_id, DPV view key
     stop_requested = QtCore.pyqtSignal(str)          # pot_id
+    measure_ru_requested = QtCore.pyqtSignal(str)    # pot_id
 
     # DPV live-view options: (menu label, key used by ControlTab).
     _DPV_LIVE_VIEWS = [
@@ -479,6 +686,11 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
 
         self.config = _CONFIG_WIDGETS[method]()
         layout.addWidget(self.config)
+
+        # Only the CV form offers iR compensation
+        if hasattr(self.config, 'measure_ru_requested'):
+            self.config.measure_ru_requested.connect(
+                lambda: self.measure_ru_requested.emit(self.pot_id))
 
         # DPV can't plot current against its own jumping potential, so the live
         # plot shows a transformed view; let the user pick which one.
@@ -510,14 +722,16 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
         smooth_layout.addWidget(self.smooth_spin)
         layout.addLayout(smooth_layout)
 
-        self.run_btn = QtWidgets.QPushButton("Run Experiment")
+        run_text = "Start Monitoring" if method == 'OCP' else "Run Experiment"
+        self.run_btn = QtWidgets.QPushButton(run_text)
         self.run_btn.setStyleSheet(
             "background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;"
         )
         self.run_btn.clicked.connect(self._on_run)
         layout.addWidget(self.run_btn)
 
-        self.stop_btn = QtWidgets.QPushButton("Stop Experiment")
+        self.stop_btn = QtWidgets.QPushButton(
+            "Stop Monitoring" if method == 'OCP' else "Stop Experiment")
         self.stop_btn.setStyleSheet(
             "background-color: #f44336; color: white; font-weight: bold; padding: 5px;"
         )
@@ -541,6 +755,18 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
         self.stop_requested.emit(self.pot_id)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("Status: Stopping...")
+
+    def set_measuring_ru(self, busy):
+        """Reflect an in-flight R_u measurement: the board is busy, so Run and
+        Measure both stay disabled until it reports back."""
+        if hasattr(self.config, 'set_measuring'):
+            self.config.set_measuring(busy)
+        self.run_btn.setEnabled(not busy)
+
+    def set_measured_r_u(self, value_ohm):
+        """Fill the form's R_u box with a freshly measured value."""
+        if hasattr(self.config, 'set_measured_r_u'):
+            self.config.set_measured_r_u(value_ohm)
 
     def _on_smooth_changed(self, val):
         self.smoothing_changed.emit(self.pot_id, val)

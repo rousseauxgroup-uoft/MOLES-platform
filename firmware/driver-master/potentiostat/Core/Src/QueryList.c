@@ -101,6 +101,7 @@ const serialQuery rdCfg_List[]={
 	{CMD_SWITCH_READ, 			0, 									NULL, 							ProcessSwitchRead},
 	{CMD_CURRENT_HOLD_STOP, 	0, 									NULL, 							ProcessCurrentHoldStop},
 	{CMD_DIAGNOSTICS_READ, 		0, 									NULL, 							ProcessDiagnosticsRead},
+	{CMD_STEP_CAPTURE, 			0, 									NULL, 							ProcessStepCapture},
 
 };
 
@@ -367,6 +368,36 @@ int32_t ProcessDacWriteBatchStep(){
 	return result;
 }
 
+
+int32_t ProcessStepCapture(void *pData, uint32_t data_len){
+	/* [u32 n_samples][u32 period_us] -> StepCapture() in analog.c: close the
+	 * CE switch and burst-sample WE_OUT raw counts into cmd_tx_buffer.
+	 * Requests are clamped, never refused, so the host always gets the
+	 * 9-byte response and reads the truth from the 'captured' count:
+	 * [u32 captured][u32 actual_duration_us][u8 gain].
+	 * The trace is then collected with CMD_BUFFER_READ. The switch is left
+	 * closed on success for the host's spike-free disconnect. */
+	static uint8_t response[9];
+	if (data_len < 8) return ILLEGAL_DATA_SIZE;
+	uint32_t *p = pData;
+	uint32_t n_samples = p[0];
+	uint32_t period_us = p[1];
+	if (period_us < 25) period_us = 25; /* per-sample overhead floor */
+	uint32_t max_by_buf = CMD_TX_BUFFER_SIZE / 2;
+	uint32_t max_by_time = 1000000UL / period_us; /* 1 s cap: watchdog margin */
+	if (n_samples > max_by_buf) n_samples = max_by_buf;
+	if (n_samples > max_by_time) n_samples = max_by_time;
+	cmd_count = 0; /* stop any batch job: the capture owns the ADC */
+	current_hold_active = 0; /* and any current hold: it owns the DAC */
+	uint32_t duration_us = 0;
+	uint32_t captured = StepCapture(n_samples, period_us, cmd_tx_buffer,
+	                                &duration_us);
+	memcpy(&response[0], &captured, 4);
+	memcpy(&response[4], &duration_us, 4);
+	response[8] = gain_val;
+	CDC_Transmit_FS(response, sizeof(response));
+	return NO_ERROR;
+}
 
 int32_t ProcessDiagnosticsRead(void *pData, uint32_t data_len){
 	//Health report for the host, 4 little-endian uint32 values:

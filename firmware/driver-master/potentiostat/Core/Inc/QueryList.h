@@ -38,6 +38,12 @@ enum
 	 * parser walks it by its own length) and a lost message cannot shift
 	 * the ring alignment (the host names the write position). */
 	CMD_BUFFER_WRITE_AT = 20,
+	/* Step-response capture for the R_u measurement:
+	 * [u32 n_samples][u32 period_us] -> close the CE switch and burst-sample
+	 * WE_OUT raw counts into cmd_tx_buffer at a cycle-counter-timed pace.
+	 * Responds [u32 captured][u32 actual_duration_us][u8 gain] after the
+	 * capture; the host then collects the trace with CMD_BUFFER_READ. */
+	CMD_STEP_CAPTURE = 21,
 };
 
 typedef struct _serialQuery
@@ -52,6 +58,7 @@ serialQuery *Get_CfgList(void);
 uint32_t GetListSize(void);
 int32_t ProcessDacWriteBatchStep();
 int32_t ProcessBufferWriteAt(void *pData, uint32_t data_len);
+int32_t ProcessStepCapture(void *pData, uint32_t data_len);
 
 extern uint8_t gain_val;
 //Batch related variables

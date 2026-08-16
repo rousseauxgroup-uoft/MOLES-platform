@@ -1,8 +1,10 @@
 """Top-level window for the unified MOLES electroanalysis interface.
 
-Three tabs sit side by side: a CV control tab, a DPV control tab, and an
-Analysis tab. Finished CV/DPV runs are handed straight to the Analysis tab so a
-result can be inspected without reloading it from disk.
+Four tabs sit side by side: a CV control tab, a DPV control tab, an OCP
+monitoring tab, and an Analysis tab. Every finished run is handed straight to
+the Analysis tab so a result can be inspected without reloading it from disk;
+the Analysis tab keeps voltammograms and OCP traces on separate plots, since
+they are read against different axes.
 """
 
 import sys
@@ -17,7 +19,8 @@ from ...logging_setup import install_qt_message_handler, setup_logging
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Tabbed window combining CV control, DPV control, and analysis."""
+    """Tabbed window combining CV control, DPV control, OCP monitoring, and
+    analysis."""
 
     def __init__(self):
         super().__init__()
@@ -29,16 +32,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cv_tab = ControlTab('CV')
         self.dpv_tab = ControlTab('DPV')
+        self.ocp_tab = ControlTab('OCP')
         self.analysis_tab = AnalysisTab()
 
         tabs.addTab(self.cv_tab, "Cyclic Voltammetry")
         tabs.addTab(self.dpv_tab, "Differential Pulse")
+        tabs.addTab(self.ocp_tab, "Open Circuit Potential")
         tabs.addTab(self.analysis_tab, "Analysis")
         self.tabs = tabs
 
         # Send finished runs to the Analysis tab automatically.
         self.cv_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)
         self.dpv_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)
+        self.ocp_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)
 
 
 def main():

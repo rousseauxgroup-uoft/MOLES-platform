@@ -252,9 +252,12 @@ class LivePotentiostat(Potentiostat):
                     if np.any(np.abs(proc_chunk[:, 1]) > 13.0):
                         raise ValueError(f"Potential out of range: {proc_chunk[:, 1]}")
 
-                    # Convert to µA to match perform_CV output units
-                    current_uA = np.round(proc_chunk[:, 0] * 1.0989e6 - 0.0632, 5)
-                    potential_V = np.round(proc_chunk[:, 1], 5)
+                    # Convert with the board's read calibrations, so the
+                    # live plot matches the saved perform_CV data exactly
+                    current_uA = np.round(
+                        self.calibrate_batch_current_uA(proc_chunk[:, 0]), 5)
+                    potential_V = np.round(
+                        self.calibrate_batch_potential_V(proc_chunk[:, 1]), 5)
 
                     self.data_callback(potential_V, current_uA)
 
