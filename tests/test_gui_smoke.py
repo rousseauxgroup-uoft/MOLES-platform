@@ -2,7 +2,7 @@
 
 Drives the CV, DPV, and OCP workers against the mock potentiostat (no hardware)
 and checks that data streams, files are written, the DPV differential curve is
-produced, and finished runs land in the Analysis tab.
+produced, and finished runs land in the Data Preview tab.
 """
 
 from pathlib import Path
@@ -43,10 +43,10 @@ def _run_worker(tab, pid):
     return captured
 
 
-def test_window_has_a_tab_per_method_plus_analysis(window):
+def test_window_has_a_tab_per_method_plus_data_preview(window):
     titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
     assert titles == ["Cyclic Voltammetry", "Differential Pulse",
-                      "Open Circuit Potential", "Analysis"]
+                      "Open Circuit Potential", "Data Preview"]
 
 
 def test_test_mode_creates_mock_panels(window):

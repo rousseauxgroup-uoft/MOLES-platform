@@ -111,6 +111,11 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 uint32_t cdc_tx_dropped = 0;   /* messages discarded because the host stopped reading */
 uint32_t cdc_rx_overflow = 0;  /* received frames discarded to protect the buffer */
 
+/* Bumped each time the receive path restarts the frame buffer after an
+ * overflow, so the parser can tell that the bytes it was working on have been
+ * replaced by a fresh frame (see Serial_Poll). */
+volatile uint32_t rcv_restarts = 0;
+
 /* Set after a transmit wait times out. While set, further transmissions are
  * dropped immediately (no waiting) so the measurement loop keeps its timing;
  * cleared as soon as the host collects the parked packet. */
@@ -294,6 +299,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 		rcv_ix = (rcv_ix + (*Len));
 	} else {
 		cdc_rx_overflow++;
+		rcv_restarts++;
 		rcv_ix = 0;
 	}
 

@@ -17,7 +17,7 @@ data_folder.mkdir(parents=True, exist_ok=True)
 # potentiostat instantiation
 ps = Potentiostat(serial_port=COM_PORT)
 ps.connect()
-ps.write_gain(4)
+ps.write_gain(0)  # the ~93 ohm range every method uses; range 4 is 1 Mohm on firmware 1.4+ and saturates above ~5 uA
 ps.write_switch(0)
 ps.write_dac(channels=[DAC.CE_IN, DAC.A_REF, DAC.V_AN], voltages=[0, -5, 0])
 

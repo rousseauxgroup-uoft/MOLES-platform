@@ -13,7 +13,7 @@ __attribute__ ((section (".bootram_data")))stBoot RstFlag;
 __attribute__ ((section(".firm_version")))stVersion FirmVersion =
 {
 		.major = 1,
-		.minor = 1,		// Added diagnostics-read command (backward-compatible)
+		.minor = 8,		// 1: diagnostics read; 2: frame-silence fix, setpoint guard, rejected-setpoint diagnostics; 3: absolute step timing, end-of-step sampling option, starvation fail-safe, timing diagnostics; 4: current-range switch table matches the TMUX6212; 5: batch auto-ranging, old auto-gain logic removed; 6: auto-ranging measures currents from the zero-current level; 7: DAC-step capture for R_u; 8: on-board iR compensation
 		.patch = 0,		// MOLES-modified build (USB stall/CV write-timeout fixes)
 		.pcb_rev = 'A',
 		.pcb_var ='1',

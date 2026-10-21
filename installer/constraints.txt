@@ -1,0 +1,25 @@
+# Package versions the installers pin MOLES to: the versions the test suite
+# and the bench have been run with. Edit this file (not requirements.txt) to
+# move to newer packages, then regenerate requirements.txt with
+# installer/lock_requirements.sh and rerun the tests.
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.62.0
+kiwisolver==1.5.0
+matplotlib==3.10.8
+numpy==2.4.3
+packaging==26.0
+pandas==3.0.1
+pillow==12.1.1
+pyparsing==3.3.2
+PyQt5==5.15.11
+# Qt itself: 5.15.2 is the last release published for Windows.
+PyQt5-Qt5==5.15.18 ; sys_platform != 'win32'
+PyQt5-Qt5==5.15.2 ; sys_platform == 'win32'
+PyQt5_sip==12.18.0
+pyqtgraph==0.14.0
+pyserial==3.5
+python-dateutil==2.9.0.post0
+scipy==1.17.1
+six==1.17.0
+xlsxwriter==3.2.9

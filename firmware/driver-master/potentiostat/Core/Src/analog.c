@@ -17,13 +17,14 @@ extern stLedConfig LED_List[LEDS_NUMBER];
 
 //analog reading related variables
 uint32_t analog_sample_count = 10;
+//Batch readings carry the current range they were taken on (one extra byte).
+//The host sets this; range changes themselves are the batch's auto-range
+//option (QueryList.c).
 uint8_t auto_gain = 1;
-uint8_t completed_ch_count = 0;
-
-//communication related
-extern uint32_t rcv_ix;
-extern uint8_t serial_rx_buffer[SERIAL_RX_BUFFER_SIZE];
-extern uint32_t usb_rx_tmr;
+//Counted up by the conversion-complete interrupt while the main loop waits on
+//it; volatile so the compiler re-reads it in those wait loops at any
+//optimisation level instead of spinning on a stale copy
+volatile uint8_t completed_ch_count = 0;
 
 //Current hold loop related variables
 float target_current_V = 1.65;
@@ -261,26 +262,6 @@ float Get_DAC_Value(eDAC_CHANNELS channel){
 	return dac_values[channel].set_val;
 }
 
-float Scale_V_Higher(float V){
-	//Scale a reading from ADC (0 to 3.3 V on ADC = -5 to 5 in practice)
-	//for 10 times higher gain, so multiply V by 10 in -5:5 and go back to 0.0:3.3
-	//(auto-gain)
-	V = ((V / 3.3) * 10.0) - 5.0;
-	V = V * 10.0;
-	V = ((V + 5.0) / 10) * 3.3;
-	return V;
-}
-
-float Scale_V_Lower(float V){
-	//Scale a reading from ADC (0 to 3.3 V on ADC = -5 to 5 in practice)
-	//for 10 times higher gain, so divide V by 10 in -5:5 and go back to 0.0:3.3
-	//(auto-gain)
-	V = ((V / 3.3) * 10.0) - 5.0;
-	V = V / 10.0;
-	V = ((V + 5.0) / 10.0) * 3.3;
-	return V;
-}
-
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   /* Prevent unused argument(s) compilation warning */
@@ -333,32 +314,30 @@ void Update_ADC_Readings(uint8_t *channels,uint8_t channel_cnt)
 		ch = channels[i];
 		an_values[ch].process_fnc(&an_values[ch]);
 	}
+	//The range-switching that used to follow here (before firmware 1.5) had
+	//one-sided thresholds on this two-sided signal, so it never moved to a
+	//more sensitive range and stepped the wrong way for large anodic
+	//currents. Ranges now change only in batches, between steps.
+}
 
-	//Auto gain
-	if (auto_gain != 1) {return;}
-	const float low_limit = 0.33 * 0.90; //V limit to increase gain
-	const float up_limit = 3.3 - 0.33; //V limit to decrease gain
-	if ((an_values[eANCH_WEOUT].mean_val > up_limit) && (gain_val > 0)) {
-		gain_val--;
-		Set_TIA_Gain((eTIA_GAIN)gain_val);
-		//scale last read value accordingly
-		an_values[eANCH_WEOUT].mean_val = Scale_V_Lower(an_values[eANCH_WEOUT].mean_val);
-		//also scale current hold related variables
-		target_current_V = Scale_V_Lower(target_current_V);
-		target_current_V = CLAMP(target_current_V,0.0,3.3);
-		//current_hold_step_V = Scale_V_Lower(current_hold_step_V);
-		old_current_V = Scale_V_Lower(old_current_V);
-	} else if (gain_val < eTIA_SW_GAIN_1M && (an_values[eANCH_WEOUT].mean_val < low_limit)) {
-		gain_val++;
-		Set_TIA_Gain((eTIA_GAIN)gain_val);
-		//scale last read value accordingly
-		an_values[eANCH_WEOUT].mean_val = Scale_V_Higher(an_values[eANCH_WEOUT].mean_val);
-		//also scale current hold related variables
-		target_current_V = Scale_V_Higher(target_current_V);
-		target_current_V = CLAMP(target_current_V,0.0,3.3);
-		//current_hold_step_V = Scale_V_Higher(current_hold_step_V);
-		old_current_V = Scale_V_Higher(old_current_V);
+float Read_WEOUT_Fast(void)
+{
+	/* One conversion of the current channel without the ten-sample average:
+	 * tens of microseconds, quick enough to catch the charging spike right
+	 * after a batch step for the auto-range decision. Returns the ADC volts,
+	 * or -1 if the converter does not finish within 1 ms. */
+	uint16_t *p_src = &adc_buf[eANCH_WEOUT][1][0];
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+	uint32_t cap_cyc = (SystemCoreClock / 1000000U) * 1000U;
+	completed_ch_count = 0;
+	HAL_ADC_Start_DMA((ADC_HandleTypeDef *)p_adc_ins[eANCH_WEOUT],
+			(uint32_t *)p_src, adc_ch_qty[eANCH_WEOUT]);
+	uint32_t t0 = DWT->CYCCNT;
+	while (completed_ch_count < 1) {
+		if ((DWT->CYCCNT - t0) > cap_cyc) return -1.0f;
 	}
+	return (float)(*p_src) * k_adc;
 }
 
 /*! \fn float Set_TIA_Gain(eTIA_GAIN gain)
@@ -370,16 +349,21 @@ void Update_ADC_Readings(uint8_t *channels,uint8_t channel_cnt)
 	\return		real gain value in float
  */
 
+static const tia_switch tia_switch_matrix[] = {
+		{SW_GAIN_93R, TIA_GAIN_93R},
+		{SW_GAIN_1K, TIA_GAIN_1K},
+		{SW_GAIN_10K, TIA_GAIN_10K},
+		{SW_GAIN_91K, TIA_GAIN_91K},
+		{SW_GAIN_1M, TIA_GAIN_1M}
+};
+
+float TIA_Gain_Ohms(eTIA_GAIN gain)
+{
+	return tia_switch_matrix[CLAMP(gain, eTIA_SW_GAIN_100, eTIA_SW_GAIN_1M)].f_gain;
+}
+
 float Set_TIA_Gain(eTIA_GAIN gain)
 {
-	const tia_switch tia_switch_matrix[] = {
-			{SW_GAIN_1K, TIA_GAIN_1K},
-			{SW_GAIN_10K, TIA_GAIN_10K},
-			{SW_GAIN_100K, TIA_GAIN_100K},
-			{SW_GAIN_1M, TIA_GAIN_1M},
-			{SW_GAIN_10M, TIA_GAIN_10M}
-	};
-
 	uint32_t val = LL_GPIO_ReadOutputPort(GPIOB);	// Read port present value
 	uint32_t ix = CLAMP(gain, eTIA_SW_GAIN_100, eTIA_SW_GAIN_1M);
 
@@ -400,12 +384,8 @@ void Pstat_RunTime(void *argument)
 		now_ms = HAL_GetTick();
 		ProcessDacWriteBatchStep();
 		CurrentHoldStep();
-		//Process USB serial data if arrived (>1ms delay means package reception is completed)
-		if(rcv_ix && ((now_ms - usb_rx_tmr) > 2))
-		{
-			Compute_Serial_Cmd();
-			rcv_ix = 0;
-		}
+		//Run the received command once its frame is complete
+		Serial_Poll();
 		//osDelay(1);
 		if ((now_ms - last_blink_ms) >= 1000){
 			last_blink_ms = now_ms; //was never updated before, so this branch ran every pass
@@ -422,24 +402,29 @@ void Pstat_RunTime(void *argument)
 	}
 }
 
-uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
-                     uint8_t *out_buf, uint32_t *actual_duration_us)
+static uint32_t Capture_Around_Step(uint32_t n_samples, uint32_t period_us,
+		uint32_t n_pre, uint8_t by_dac, float dac_v, uint8_t *out_buf,
+		uint32_t *actual_duration_us, uint32_t *centre_ns)
 {
-	/* Close the CE switch and record WE_OUT raw ADC counts at a fixed pace,
-	 * timed by the CPU cycle counter. Used for the R_u step measurement: in
-	 * the instant after the switch closes the cell behaves like a plain
-	 * resistor, and this loop starts sampling within microseconds of that
-	 * instant — over the serial link the first reading lands one USB round
-	 * trip (~3 ms) later, past most of the transient at typical cell time
-	 * constants.
+	/* Record WE_OUT raw ADC counts at a fixed pace, timed by the CPU cycle
+	 * counter, and make a potential step as sample n_pre is due: either by
+	 * closing the CE switch onto a DAC already parked at the step potential,
+	 * or by moving the DAC with the cell already connected. Used for the R_u
+	 * measurement: in the instant after the step the cell behaves like a
+	 * plain resistor, and this loop samples within microseconds of that
+	 * instant, where a reading over the serial link lands one USB round trip
+	 * (~3 ms) later, past most of the transient.
 	 *
-	 * Raw single conversions, deliberately: no oversampling, no auto-gain,
-	 * no calibration — the host converts counts with its own calibration,
-	 * and the gain is whatever the host set before the capture.
+	 * Raw oversampled conversions, deliberately: no averaging across
+	 * samples, no auto-gain, no calibration. The host converts counts with
+	 * its own calibration, and the gain is whatever the host set before the
+	 * capture.
 	 *
 	 * On success the switch is LEFT CLOSED so the host can do its
 	 * spike-free disconnect; a wedged ADC conversion opens it here (raw,
-	 * fail-safe) and returns the samples captured so far. */
+	 * fail-safe) and returns the samples captured so far. When centre_ns is
+	 * given it receives the time from the step to the middle of the first
+	 * conversion after it. */
 	uint16_t *out = (uint16_t *)out_buf;
 	uint16_t *p_src = &adc_buf[eANCH_WEOUT][1][0];
 	uint32_t captured = 0;
@@ -452,14 +437,21 @@ uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
 	uint32_t cyc_per_us = SystemCoreClock / 1000000U;
 	uint32_t period_cyc = period_us * cyc_per_us;
 	uint32_t conv_cap_cyc = 2000U * cyc_per_us; /* a conversion takes ~us; 2 ms means wedged */
+	uint32_t step_cyc = 0;
 
 	uint32_t t0 = DWT->CYCCNT;
-	HAL_GPIO_WritePin(CE_EN_GPIO_Port, CE_EN_Pin, GPIO_PIN_SET);
-	switch_val = eSWITCH_ON;
-
 	for (uint32_t i = 0; i < n_samples; i++){
 		uint32_t due = t0 + (i * period_cyc);
 		while ((int32_t)(DWT->CYCCNT - due) < 0) {}
+		if (i == n_pre) {
+			step_cyc = DWT->CYCCNT;
+			if (by_dac) {
+				Set_DAC_Value(eDAC_VCEIN, dac_v);
+			} else {
+				HAL_GPIO_WritePin(CE_EN_GPIO_Port, CE_EN_Pin, GPIO_PIN_SET);
+				switch_val = eSWITCH_ON;
+			}
+		}
 		completed_ch_count = 0;
 		HAL_ADC_Start_DMA((ADC_HandleTypeDef *)p_adc_ins[eANCH_WEOUT],
 				(uint32_t *)p_src, adc_ch_qty[eANCH_WEOUT]);
@@ -472,6 +464,11 @@ uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
 				return captured;
 			}
 		}
+		if (i == n_pre && centre_ns != NULL) {
+			uint32_t done = DWT->CYCCNT;
+			*centre_ns = (uint32_t)(((uint64_t)(conv_t0 - step_cyc)
+					+ (uint64_t)(done - step_cyc)) * 500U / cyc_per_us);
+		}
 		out[captured++] = *p_src;
 		/* Deliberate foreground work, not a hang: keep the watchdog fed the
 		 * way the main loop does. The bounded conversion wait above keeps a
@@ -480,6 +477,27 @@ uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
 	}
 	*actual_duration_us = (DWT->CYCCNT - t0) / cyc_per_us;
 	return captured;
+}
+
+uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
+                     uint8_t *out_buf, uint32_t *actual_duration_us)
+{
+	/* The step is the CE switch closing, at the first sample. While the
+	 * switch was open the control amplifier wound up against its rail, so
+	 * the first ~50 us of the trace are its recovery, not the cell. */
+	return Capture_Around_Step(n_samples, period_us, 0, 0, 0.0f, out_buf,
+	                           actual_duration_us, NULL);
+}
+
+uint32_t DacStepCapture(uint32_t n_samples, uint32_t period_us, uint32_t n_pre,
+                        float dac_v, uint8_t *out_buf,
+                        uint32_t *actual_duration_us, uint32_t *centre_ns)
+{
+	/* The step is the DAC moving to dac_v at sample n_pre, with the cell
+	 * already connected and the loop in control, so the trace holds only
+	 * the cell's response; the n_pre samples before it give its zero. */
+	return Capture_Around_Step(n_samples, period_us, n_pre, 1, dac_v,
+	                           out_buf, actual_duration_us, centre_ns);
 }
 
 int32_t CurrentHoldStep(){

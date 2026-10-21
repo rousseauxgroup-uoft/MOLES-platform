@@ -8,7 +8,9 @@ to a callback as it arrives from the hardware, enabling live plot updates.
 early stop — it is caught by ``CVWorker`` to trigger a clean shutdown.
 ``HostLagError`` is raised when this computer cannot keep up with the
 device's data stream; the run is aborted safely before Windows would cut
-off communication mid-stream.
+off communication mid-stream. ``WaveformTrackingError`` (from the driver) is
+raised when the output stops following the programmed waveform; the cell is
+disconnected before it propagates.
 """
 
 import logging
@@ -16,7 +18,7 @@ import time
 
 import numpy as np
 
-from ..driver.ps4_ref import Commands, Potentiostat
+from ..driver.ps4_ref import Commands, Potentiostat, WaveformTracker
 
 logger = logging.getLogger(__name__)
 
@@ -103,15 +105,29 @@ class LivePotentiostat(Potentiostat):
             except Exception:
                 pass
 
-    def write_voltage_batch(self, voltages, delay):
+    def write_voltage_batch(self, voltages, delay, before_start=None,
+                            auto_range=False, range_period=1, lead_in=0,
+                            ir=None):
         """Run a voltage sweep and emit live data chunks as they arrive.
 
         Identical to the parent ``write_voltage_batch`` except that after
         parsing each 6-point chunk it validates the readings, converts them
         to real units (V, µA), and calls ``self.data_callback``. Corrupted
-        chunks (frame-shift artifacts) are logged and skipped rather than
-        crashing the sweep.
+        chunks (frame-shift artifacts) are marked invalid in the returned
+        data and left off the live plot rather than crashing the sweep. Like
+        the parent, it stops the run and disconnects the cell
+        (``WaveformTrackingError``) if the output leaves the programmed
+        waveform, holds the port lock for the whole batch, and leaves the
+        run's report in ``last_batch_report``.
         """
+        with self._port_lock:
+            return self._write_voltage_batch_live(voltages, delay, before_start,
+                                                  auto_range, range_period, lead_in,
+                                                  ir)
+
+    def _write_voltage_batch_live(self, voltages, delay, before_start,
+                                  auto_range=False, range_period=1, lead_in=0,
+                                  ir=None):
         v_per_chunk = 6       # potentials written to hardware per transaction
         bytes_per_v = 4       # each potential is a float32
         tx_len = v_per_chunk * bytes_per_v
@@ -147,8 +163,8 @@ class LivePotentiostat(Potentiostat):
         first_tx_bytes -= first_tx_bytes % tx_len  # keep chunk-aligned
 
         tx_ind = 0
-        self._reset_buffer(0)
-        self._write_to_buffer(v_bytes[0:first_tx_bytes])
+        report = self._begin_batch_report(delay, auto_range, range_period, ir)
+        ring_pos = self._start_waveform_upload(v_bytes[0:first_tx_bytes])
         time.sleep(0.01)  # allow hardware to receive the pre-fill before starting
         tx_ind = first_tx_bytes
 
@@ -156,126 +172,141 @@ class LivePotentiostat(Potentiostat):
         rx_len = 9 if self._auto_gain else 8
 
         temp_adc = np.zeros((v_count, 2), np.float32)
-        temp_res_val = np.zeros(v_count, np.float32)
-        temp_gain = 0
+        # The range each point was read on: reported per point when readings
+        # carry it, else the range set before the run
+        temp_range = np.full(v_count, self._range_index(), dtype=int)
+        res_table = self._res_table()
+        tracker = WaveformTracker(voltages)
 
-        # retry=False: re-sending EXECUTE mid-stream would corrupt the batch protocol.
-        self._write_cmd(Commands.EXECUTE_VOLTAGE_BATCH, np.uint32([delay, v_count]), True, retry=False)
+        if before_start is not None:
+            before_start()
+        # A stop during the quiet time ends the run before the batch starts
+        if self.stop_event and self.stop_event.is_set():
+            raise ExperimentStopped("Stop requested by user")
+        self._execute_batch(delay, v_count, report)
 
         backlog_warned = False
         telemetry_t0 = time.time()
 
-        for i in range(0, v_count, v_per_chunk):
-            # Check for a user stop before blocking on the next hardware read.
-            # The stream must be halted and drained BEFORE we stop reading,
-            # otherwise the device is left transmitting into a closed pipe.
-            if self.stop_event and self.stop_event.is_set():
-                self._halt_batch_stream()
-                raise ExperimentStopped("Stop requested by user")
+        with self._batch_read_timeout(delay):
+            for i in range(0, v_count, v_per_chunk):
+                # Check for a user stop before blocking on the next hardware read.
+                # The stream must be halted and drained BEFORE we stop reading,
+                # otherwise the device is left transmitting into a closed pipe.
+                if self.stop_event and self.stop_event.is_set():
+                    self._halt_batch_stream()
+                    raise ExperimentStopped("Stop requested by user")
 
-            # Backlog guard: if unread data piles up, this computer is falling
-            # behind the device. Warn early; abort safely well before Windows
-            # would cut off USB reads mid-stream (~12 kB of backlog).
-            backlog = self.serial.in_waiting
-            if backlog >= BACKLOG_ABORT_BYTES:
-                logger.error(
-                    "[PS %s] Host fell %d bytes behind the data stream — "
-                    "aborting run before communication is lost.",
-                    self.device_ID, backlog,
-                )
-                self._halt_batch_stream()
-                self.write_switch(False)  # fail-safe: cut cell power before raising
-                raise HostLagError(
-                    f"This computer could not keep up with the device "
-                    f"({backlog} bytes behind). The run was stopped safely. "
-                    f"Close other programs or reduce the plotted data before retrying."
-                )
-            if backlog >= BACKLOG_WARN_BYTES and not backlog_warned:
-                backlog_warned = True
-                logger.warning(
-                    "[PS %s] Host is lagging the data stream (%d bytes unread).",
-                    self.device_ID, backlog,
-                )
-            elif backlog < BACKLOG_WARN_BYTES // 2:
-                backlog_warned = False  # recovered; re-arm the warning
+                # Backlog guard: if unread data piles up, this computer is falling
+                # behind the device. Warn early; abort safely well before Windows
+                # would cut off USB reads mid-stream (~12 kB of backlog).
+                backlog = self.serial.in_waiting
+                if backlog >= BACKLOG_ABORT_BYTES:
+                    logger.error(
+                        "[PS %s] Host fell %d bytes behind the data stream — "
+                        "aborting run before communication is lost.",
+                        self.device_ID, backlog,
+                    )
+                    self._halt_batch_stream()
+                    self.write_switch(False)  # fail-safe: cut cell power before raising
+                    raise HostLagError(
+                        f"This computer could not keep up with the device "
+                        f"({backlog} bytes behind). The run was stopped safely. "
+                        f"Close other programs or reduce the plotted data before retrying."
+                    )
+                if backlog >= BACKLOG_WARN_BYTES and not backlog_warned:
+                    backlog_warned = True
+                    logger.warning(
+                        "[PS %s] Host is lagging the data stream (%d bytes unread).",
+                        self.device_ID, backlog,
+                    )
+                elif backlog < BACKLOG_WARN_BYTES // 2:
+                    backlog_warned = False  # recovered; re-arm the warning
 
-            # Periodic loop-rate log: makes a slow host visible long before it fails.
-            if i and (i // v_per_chunk) % TELEMETRY_EVERY_ITERS == 0:
-                now = time.time()
-                rate = TELEMETRY_EVERY_ITERS / max(now - telemetry_t0, 1e-9)
-                telemetry_t0 = now
-                logger.info(
-                    "[PS %s] Batch loop at %.1f it/s (need %.1f), backlog %d B",
-                    self.device_ID, rate, 1000.0 / max(float(delay), 1.0) / v_per_chunk,
-                    backlog,
-                )
+                # Periodic loop-rate log: makes a slow host visible long before it fails.
+                if i and (i // v_per_chunk) % TELEMETRY_EVERY_ITERS == 0:
+                    now = time.time()
+                    rate = TELEMETRY_EVERY_ITERS / max(now - telemetry_t0, 1e-9)
+                    telemetry_t0 = now
+                    logger.info(
+                        "[PS %s] Batch loop at %.1f it/s (need %.1f), backlog %d B",
+                        self.device_ID, rate, 1000.0 / max(float(delay), 1.0) / v_per_chunk,
+                        backlog,
+                    )
 
-            data = self._read_from_buffer(rx_len * v_per_chunk)
-            if (tx_ind + tx_len) <= v_byte_count:
-                self._write_to_buffer(v_bytes[tx_ind:tx_ind + tx_len])
-                tx_ind += tx_len
+                data = self._read_batch_chunk(rx_len * v_per_chunk)
+                report['chunk_times_s'].append(time.monotonic())
+                if (tx_ind + tx_len) <= v_byte_count:
+                    ring_pos = self._write_waveform(v_bytes[tx_ind:tx_ind + tx_len], ring_pos)
+                    tx_ind += tx_len
 
-            chunk_adc = np.zeros((v_per_chunk, 2), np.float32)
-            chunk_res = np.zeros(v_per_chunk, np.float32)
-            temp_ind = 0
+                chunk_adc = np.zeros((v_per_chunk, 2), np.float32)
+                temp_ind = 0
 
-            for j in range(v_per_chunk):
-                temp_adc[i + j, :] = np.frombuffer(data, np.float32, 2, temp_ind)
-                chunk_adc[j, :] = temp_adc[i + j, :]
-                temp_ind += 8
-                if self._auto_gain:
-                    temp_gain = np.frombuffer(data, np.uint8, 1, temp_ind)[0]
-                    temp_res_val[i + j] = self.res_vals[temp_gain]
-                    chunk_res[j] = self.res_vals[temp_gain]
-                    temp_ind += 1
-
-            # Live emission: validate, convert to real units, call callback
-            if self.data_callback:
-                try:
+                for j in range(v_per_chunk):
+                    temp_adc[i + j, :] = np.frombuffer(data, np.float32, 2, temp_ind)
+                    temp_ind += 8
+                    # Raw floats parsed off-register are usually huge numbers
+                    if np.any(np.abs(temp_adc[i + j, :]) > 15.0):
+                        logger.warning("[PS %s] Frame shift detected! Invalid "
+                                       "potential/current raw: %s",
+                                       self.device_ID, temp_adc[i + j, :])
+                        temp_adc[i + j, :] = np.nan
                     if self._auto_gain:
-                        # Valid shunt resistor values for this hardware
-                        valid_res_values = [1e2, 1e3, 1e4, 1e5, 1e6, 1e7]
-                        for val in chunk_res:
-                            if val not in valid_res_values:
-                                raise ValueError(f"Invalid resistor value: {val}")
+                        temp_gain = int(np.frombuffer(data, np.uint8, 1, temp_ind)[0])
+                        temp_ind += 1
+                        # An impossible gain index means the frame is shifted:
+                        # invalidate the point rather than let a KeyError
+                        # abandon the stream mid-run
+                        if temp_gain in self.res_vals:
+                            temp_range[i + j] = temp_gain
+                        else:
+                            logger.warning("[PS %s] Frame shift detected! Invalid "
+                                           "gain index: %s", self.device_ID, temp_gain)
+                            temp_range[i + j] = 0
+                            temp_adc[i + j, :] = np.nan
+                    chunk_adc[j, :] = temp_adc[i + j, :]
+                chunk_range = temp_range[i:i + v_per_chunk]
 
-                    proc_chunk = self._scale_output_voltages(chunk_adc.copy())
+                # Live emission: validate, convert to real units, call callback.
+                # Lead-in and padding points are not part of the result, so
+                # not plotted either.
+                first = max(0, lead_in - i)
+                last = min(v_per_chunk, v_count - pad_count - i)
+                if self.data_callback and first < last:
+                    try:
+                        proc_chunk = self._scale_output_voltages(chunk_adc[first:last].copy())
+                        # IUPAC sign convention
+                        proc_chunk[:, 0] = -proc_chunk[:, 0] / res_table[chunk_range[first:last]]
 
-                    if self._auto_gain:
-                        proc_chunk[:, 0] = np.divide(proc_chunk[:, 0], chunk_res)
-                    else:
-                        proc_chunk[:, 0] /= self.ResistorVal
+                        # Potential sanity check — hardware max is ~±5 V; >13 V signals a frame shift
+                        if np.any(np.abs(proc_chunk[:, 1]) > 13.0):
+                            raise ValueError(f"Potential out of range: {proc_chunk[:, 1]}")
+                        if not np.all(np.isfinite(proc_chunk)):
+                            raise ValueError("chunk holds invalid samples")
 
-                    proc_chunk[:, 0] *= -1.0  # IUPAC sign convention
+                        # Convert with the board's read calibrations, so the
+                        # live plot matches the saved perform_CV data exactly
+                        current_uA = np.round(
+                            self.calibrate_batch_current_uA(proc_chunk[:, 0],
+                                                            chunk_range[first:last]), 5)
+                        potential_V = np.round(
+                            self.calibrate_batch_potential_V(proc_chunk[:, 1]), 5)
 
-                    # Potential sanity check — hardware max is ~±5 V; >13 V signals a frame shift
-                    if np.any(np.abs(proc_chunk[:, 1]) > 13.0):
-                        raise ValueError(f"Potential out of range: {proc_chunk[:, 1]}")
+                        self.data_callback(potential_V, current_uA)
 
-                    # Convert with the board's read calibrations, so the
-                    # live plot matches the saved perform_CV data exactly
-                    current_uA = np.round(
-                        self.calibrate_batch_current_uA(proc_chunk[:, 0]), 5)
-                    potential_V = np.round(
-                        self.calibrate_batch_potential_V(proc_chunk[:, 1]), 5)
+                    except ValueError as ve:
+                        logger.warning("[PS %s] Skipping corrupted chunk: %s", self.device_ID, ve)
+                    except Exception as e:
+                        logger.warning("[PS %s] Live callback error: %s", self.device_ID, e)
 
-                    self.data_callback(potential_V, current_uA)
+                # Checked after the chunk is plotted, so the moment it went
+                # wrong stays visible on screen
+                fault = tracker.update(i, self._scale_output_voltages(chunk_adc[:, 1]))
+                if fault:
+                    self._abort_waveform_run(fault)
 
-                except ValueError as ve:
-                    logger.warning("[PS %s] Skipping corrupted chunk: %s", self.device_ID, ve)
-                except Exception as e:
-                    logger.warning("[PS %s] Live callback error: %s", self.device_ID, e)
-
-        # Final full-array processing (same as parent, returns calibrated data)
-        temp_adc = self._scale_output_voltages(temp_adc)
-        if self._auto_gain:
-            temp_adc[:, 0] = np.divide(temp_adc[:, 0], temp_res_val)
-            self.Resistor = temp_gain
-            self.ResistorVal = temp_res_val[-1]
-        else:
-            temp_adc[:, 0] /= self.ResistorVal
-        temp_adc[:, 0] *= -1
-
-        if pad_count == 0:
-            return temp_adc
-        return temp_adc[:-pad_count, :]
+        # Same final processing as the parent: raw currents and potentials,
+        # the range of each point, and the run report
+        return self._finish_batch_currents(temp_adc, temp_range, report,
+                                           v_count - pad_count, v_per_chunk, lead_in)

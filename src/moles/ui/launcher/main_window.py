@@ -1,16 +1,20 @@
 """Main window of the MOLES launcher.
 
-The launcher itself never opens a serial port — it only reads the board
-registry (``~/.moles/potentiostats.csv``) and the claim files
-(``~/.moles/claims/``), so it can stay open indefinitely without ever
-interfering with running experiments. Apps are spawned as *detached*
-processes: closing the launcher never kills a running experiment.
+The launcher's table comes from the board registry
+(``~/.moles/potentiostats.csv``), the claim files (``~/.moles/claims/``) and
+the firmware notes apps leave when they connect (``~/.moles/firmware/``), so
+it can stay open indefinitely without ever interfering with running
+experiments. It opens a serial port only when asked to check firmware, and
+then only on boards no app holds, each under a claim of its own for the
+second or so it takes. Apps are spawned as *detached* processes: closing the
+launcher never kills a running experiment.
 """
 
 import logging
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from serial.tools import list_ports
@@ -18,10 +22,13 @@ from serial.tools import list_ports
 # moles/ui/__init__.py runs automatically when this subpackage is imported,
 # applying the macOS Qt plugin fix before QApplication is created.
 
-from ... import claims
+from ... import __version__, claims
 from ...logging_setup import install_qt_message_handler, setup_logging
+from ...onboarding import firmware
+from ...onboarding.discovery import probe_firmware
 from ...onboarding.registry import load_registry
 from ..visual_identity import apply_app_icon, load_logo_pixmap
+from .update_offer import UpdateCheckThread, UpdateOffer
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +39,19 @@ REFRESH_MS = 2000
 APPS = (
     ("Electrolysis", "moles.ui.electrolysis"),
     ("Electroanalysis (CV / DPV)", "moles.ui.electroanalysis"),
+    ("Data Analysis", "moles.ui.data_analysis"),
     ("Onboarding", "moles.ui.onboarding"),
     ("Settings", "moles.ui.settings"),
 )
 
-COL_NAME, COL_PORT, COL_CAL, COL_STATUS = range(4)
-TABLE_HEADERS = ("Board", "Port", "Calibrated", "Status")
+COL_NAME, COL_PORT, COL_CAL, COL_FW, COL_STATUS = range(5)
+TABLE_HEADERS = ("Board", "Port", "Calibrated", "Firmware", "Status")
 
 # Display height of the mascot logo next to the launch buttons.
 LOGO_HEIGHT_PX = 128
+
+# Delay before asking GitHub about updates, so the window appears first.
+UPDATE_CHECK_DELAY_MS = 1500
 
 
 def _connected_usb_serials():
@@ -99,15 +110,68 @@ def launch_detached(module: str):
     return subprocess.Popen([_detached_python(), "-m", module], **kwargs)
 
 
+def check_firmware(boards):
+    """Read the firmware release of each idle board and note it.
+
+    ``boards`` holds (claim key, USB serial, port) triples. Each board is
+    claimed for the duration of its read, so an app starting on it at that
+    moment is told the launcher has it rather than colliding on the port; a
+    board that is claimed already is skipped. Returns {USB serial: version,
+    or None when it could not be read}.
+    """
+    def read_one(board):
+        key, usb_serial, port = board
+        try:
+            claims.acquire(key, app="launcher",
+                           experiment="reading firmware version", port=port)
+        except claims.ClaimBusyError:
+            return usb_serial, None
+        try:
+            version = probe_firmware(port)
+        finally:
+            claims.release(key)
+        if version is not None:
+            firmware.record(usb_serial, version)
+        return usb_serial, version
+
+    if not boards:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(boards)) as pool:
+        return dict(pool.map(read_one, boards))
+
+
+class FirmwareCheckThread(QtCore.QThread):
+    """Runs check_firmware away from the window so it stays responsive."""
+
+    checked = QtCore.pyqtSignal(dict)
+
+    def __init__(self, boards, parent=None):
+        super().__init__(parent)
+        self._boards = boards
+
+    def run(self):
+        try:
+            results = check_firmware(self._boards)
+        except Exception:
+            logger.exception("Firmware check failed")
+            results = {serial: None for _key, serial, _port in self._boards}
+        self.checked.emit(results)
+
+
 class LauncherWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MOLES Launcher")
-        self.resize(760, 480)
+        self.setWindowTitle(f"MOLES Launcher {__version__}")
+        self.resize(860, 480)
 
         # row index -> claim key, rebuilt on every refresh, so the
         # force-release button knows what the selected row refers to.
         self._row_keys = []
+        # (claim key, USB serial, port, name) of boards present and unclaimed
+        # at the last refresh: the ones a firmware check can read.
+        self._idle_boards = []
+        self._fw_thread = None
+        self._fw_names = {}
 
         self._build_ui()
         self.refresh()
@@ -115,6 +179,11 @@ class LauncherWindow(QtWidgets.QMainWindow):
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(REFRESH_MS)
+
+        self._update_check = None
+        self._update_offer = UpdateOffer(self)
+        self._update_offer.installer_opened.connect(self.close)
+        QtCore.QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self._check_for_update)
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -162,6 +231,13 @@ class LauncherWindow(QtWidgets.QMainWindow):
 
         # --- Force release (guarded) ---
         force_row = QtWidgets.QHBoxLayout()
+        self.fw_btn = QtWidgets.QPushButton("Check Firmware")
+        self.fw_btn.setToolTip(
+            "Read the firmware version of every connected board that no app is using.\n"
+            "Boards in use keep the version noted when their app connected."
+        )
+        self.fw_btn.clicked.connect(self._check_firmware)
+        force_row.addWidget(self.fw_btn)
         self.force_btn = QtWidgets.QPushButton("Force Release Selected")
         self.force_btn.setEnabled(False)
         self.force_btn.setToolTip(
@@ -206,17 +282,21 @@ class LauncherWindow(QtWidgets.QMainWindow):
             live_port = present.get(entry.usb_serial)
             rows.append((entry.name, live_port or entry.port or "—",
                          "yes" if entry.is_calibrated else "no",
-                         key, all_claims.get(key), live_port is not None))
+                         key, all_claims.get(key), live_port is not None,
+                         entry.usb_serial))
         # Claims that match no registry row (e.g. legacy port-keyed claims, or
         # a board that was renamed) still need to be visible and releasable.
         for key, claim in sorted(all_claims.items()):
             if key not in seen_keys:
-                rows.append(("?", claim.port or "—", "—", key, claim, True))
+                rows.append(("?", claim.port or "—", "—", key, claim, True, ""))
 
         self.table.setRowCount(len(rows))
         self._row_keys = []
-        for r, (name, port, calibrated, key, claim, connected) in enumerate(rows):
+        self._idle_boards = []
+        for r, (name, port, calibrated, key, claim, connected, usb_serial) in enumerate(rows):
             self._row_keys.append(key)
+            if connected and claim is None and usb_serial:
+                self._idle_boards.append((key, usb_serial, port, name))
             # A claim outranks presence: a claimed-but-unplugged board is a
             # problem the user should see described, not hidden behind
             # "Not connected".
@@ -230,8 +310,10 @@ class LauncherWindow(QtWidgets.QMainWindow):
             else:
                 status, color = "Free", QtCore.Qt.darkGreen
 
+            fw_text, fw_tip, fw_outdated = _firmware_cell(usb_serial)
             for c, text in ((COL_NAME, name), (COL_PORT, port),
-                            (COL_CAL, calibrated), (COL_STATUS, status)):
+                            (COL_CAL, calibrated), (COL_FW, fw_text),
+                            (COL_STATUS, status)):
                 item = QtWidgets.QTableWidgetItem(text)
                 if c == COL_STATUS:
                     item.setForeground(QtGui.QBrush(color))
@@ -239,6 +321,10 @@ class LauncherWindow(QtWidgets.QMainWindow):
                 elif not connected and claim is None:
                     # Grey the whole row for absent boards so free ones pop.
                     item.setForeground(QtGui.QBrush(QtCore.Qt.gray))
+                elif c == COL_FW and fw_outdated:
+                    item.setForeground(QtGui.QBrush(QtCore.Qt.darkYellow))
+                if c == COL_FW:
+                    item.setToolTip(fw_tip)
                 self.table.setItem(r, c, item)
 
         if not rows:
@@ -258,6 +344,7 @@ class LauncherWindow(QtWidgets.QMainWindow):
         if selected_key in self._row_keys:
             self.table.selectRow(self._row_keys.index(selected_key))
         self._update_force_btn()
+        self.fw_btn.setEnabled(self._fw_thread is None and bool(self._idle_boards))
 
     # ------------------------------------------------------------------
     # Actions
@@ -272,6 +359,45 @@ class LauncherWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(
                 self, "Launch failed", f"Could not start {label}:\n{e}"
             )
+
+    def _check_firmware(self):
+        boards = list(self._idle_boards)
+        if not boards or self._fw_thread is not None:
+            return
+        self._fw_names = {serial: name for _key, serial, _port, name in boards}
+        self._fw_thread = FirmwareCheckThread(
+            [(key, serial, port) for key, serial, port, _name in boards], self)
+        self._fw_thread.checked.connect(self._on_firmware_checked)
+        self.fw_btn.setEnabled(False)
+        self.fw_btn.setText("Checking…")
+        self._fw_thread.start()
+
+    def _on_firmware_checked(self, results):
+        self._fw_thread.wait()
+        self._fw_thread = None
+        self.fw_btn.setText("Check Firmware")
+        read = [f"{self._fw_names.get(s, s)} {v}" for s, v in results.items() if v]
+        missed = [self._fw_names.get(s, s) for s, v in results.items() if not v]
+        self.refresh()
+        message = "Firmware: " + (", ".join(read) if read else "none read")
+        if missed:
+            message += f". Could not read {', '.join(missed)} (busy or not responding)."
+        self.status_label.setText(message)
+
+    def _check_for_update(self):
+        self._update_check = UpdateCheckThread(self)
+        self._update_check.found.connect(self._update_offer.offer)
+        self._update_check.start()
+
+    def closeEvent(self, event):
+        # A check in progress holds claims and open ports; let it finish (it
+        # takes about a second) rather than tear the thread down mid-read.
+        if self._fw_thread is not None:
+            self._fw_thread.wait(10_000)
+        self._update_offer.shutdown()
+        if self._update_check is not None:
+            self._update_check.wait(10_000)
+        super().closeEvent(event)
 
     def _selected_key(self):
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
@@ -315,6 +441,24 @@ class LauncherWindow(QtWidgets.QMainWindow):
         if answer == QtWidgets.QMessageBox.Yes:
             claims.force_release(key)
             self.refresh()
+
+
+def _firmware_cell(usb_serial):
+    """Text, tooltip, and whether it is out of date, for a board's firmware."""
+    note = firmware.read(usb_serial)
+    if note is None:
+        return ("—",
+                "Not read yet. MOLES notes a board's firmware whenever an app "
+                "connects to it;\nCheck Firmware reads it now from boards no app "
+                "is using.", False)
+    version = note["version"]
+    when = note["read_at"].replace("T", " ")[:16]
+    tip = f"Firmware {version}, read {when}."
+    if firmware.is_outdated(version):
+        tip += (f"\nVersion {firmware.LATEST_VERSION} is in firmware/prebuilt/; "
+                "its README lists what each release adds.")
+        return f"{version} (update to {firmware.LATEST_VERSION})", tip, True
+    return version, tip, False
 
 
 def main():

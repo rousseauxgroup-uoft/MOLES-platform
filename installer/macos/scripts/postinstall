@@ -1,0 +1,15 @@
+#!/bin/bash
+# Runs after MOLES.app is copied in: downloads Python and the packages into
+# it. A failure here makes Installer report that the installation failed;
+# the details are in the log named below.
+APP="$2/MOLES.app"
+LOG="/Library/Logs/MOLES-install.log"
+VERSION="$(/usr/bin/defaults read "$APP/Contents/Info.plist" CFBundleShortVersionString)"
+
+"$APP/Contents/Resources/setup/install_env.sh" "$APP" "$VERSION" > "$LOG" 2>&1
+status=$?
+if [ $status -ne 0 ]; then
+    echo "== FAILED (exit $status)" >> "$LOG"
+    rm -rf "$APP/Contents/Resources/runtime"
+fi
+exit $status

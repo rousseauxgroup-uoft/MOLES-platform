@@ -353,7 +353,7 @@ class ControlTab(QtWidgets.QWidget):
         worker = VoltammetryWorker(
             pot_id, port, params, use_mock=self.test_mode_cb.isChecked()
         )
-        worker.signals.status.connect(self._panels[pot_id].update_status)
+        worker.signals.status.connect(self._on_worker_status)
         worker.signals.data_chunk.connect(self._on_data_chunk)
         worker.signals.finished.connect(self._on_finished)
 
@@ -378,7 +378,7 @@ class ControlTab(QtWidgets.QWidget):
         panel.set_measuring_ru(True)
 
         worker = RuWorker(pot_id, port, use_mock=self.test_mode_cb.isChecked())
-        worker.signals.status.connect(panel.update_status)
+        worker.signals.status.connect(self._on_worker_status)
         worker.signals.finished.connect(self._on_r_u_measured)
         QtCore.QThreadPool.globalInstance().start(worker)
 
@@ -666,9 +666,20 @@ class ControlTab(QtWidgets.QWidget):
     # Completion
     # ------------------------------------------------------------------
 
+    def _on_worker_status(self, pot_id, msg):
+        """Show a worker's progress on its board's panel. The signal carries
+        the board as well as the message, so it cannot feed the panel's
+        one-argument update_status directly: Qt would pass it the board name."""
+        panel = self._panels.get(pot_id)
+        if panel is not None:
+            panel.update_status(msg)
+
     def _on_finished(self, pot_id, success, msg, result, filepath):
         """Handle worker completion: finalize the plot and announce the save."""
         self._active_workers.pop(pot_id, None)
+        # Every outcome is a final state, so the panel re-enables Run
+        if not (success or msg == "Stopped" or msg.startswith("Error")):
+            msg = f"Error: {msg}"
         self._panels[pot_id].update_status(msg)
 
         if msg == "Stopped":
@@ -676,6 +687,10 @@ class ControlTab(QtWidgets.QWidget):
             return
 
         if not success or result is None:
+            # A run cut short by a fault keeps its data too: it is the record
+            # of what the cell actually experienced before the stop.
+            if not success:
+                self._offer_partial_save(pot_id, reason=msg)
             return
 
         if result['method'] == 'DPV':
@@ -699,8 +714,11 @@ class ControlTab(QtWidgets.QWidget):
         if filepath:
             self.run_finished.emit(filepath)
 
-    def _offer_partial_save(self, pot_id):
+    def _offer_partial_save(self, pot_id, reason=None):
         """Offer to save whatever data was streamed before an early stop.
+
+        ``reason`` is the error that ended the run, when it did not end by the
+        user pressing Stop; such runs are only offered when data was collected.
 
         For DPV this is the raw staircase (a clean differential curve needs the
         full sweep), so the partial file is saved as plain potential/current
@@ -711,10 +729,13 @@ class ControlTab(QtWidgets.QWidget):
         data = self._live_data.get(pot_id, self._empty_live_data())
         v_data, i_data = self._merged_arrays(data)
         n_pts = len(v_data)
+        if reason is not None and n_pts == 0:
+            return
 
+        ended = "was stopped." if reason is None else f"ended early:\n{reason}"
         reply = QtWidgets.QMessageBox.question(
             self, "Save Partial Data?",
-            f"The run on PS {pot_id} was stopped.\n"
+            f"The run on PS {pot_id} {ended}\n"
             f"{n_pts} data point{'s' if n_pts != 1 else ''} were collected.\n\n"
             "Would you like to save the partial data?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,

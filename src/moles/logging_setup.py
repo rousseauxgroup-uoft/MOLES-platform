@@ -39,6 +39,15 @@ LOG_DIR = Path.home() / ".moles" / "logs"
 RESOURCE_MONITOR_INTERVAL_S = 60
 RESOURCE_WARN_THRESHOLD = 8000
 
+# Minimum gap between copies of an identical Qt message. Qt diagnostics are
+# emitted by the GUI thread, including from inside painting, and every log
+# record is written and flushed synchronously — so a warning that repeats per
+# repaint turns painting into one disk flush per frame. Repeats are counted and
+# reported periodically instead of written out one by one.
+QT_MESSAGE_REPEAT_WINDOW_S = 10.0
+# Ceiling on distinct Qt messages tracked for that throttle.
+QT_MESSAGE_CACHE_MAX = 256
+
 _configured = False
 
 
@@ -60,8 +69,13 @@ def setup_logging(app_name: str = "moles") -> logging.Logger:
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)-8s [%(threadName)s] %(name)s: %(message)s"
     )
+    # One file per process. MOLES apps are designed to run several at a time
+    # (see moles.claims), and a rotating handler shared between processes cannot
+    # roll over on Windows — the rename fails while another process holds the
+    # file open, and records are dropped without a trace.
+    log_path = LOG_DIR / f"{app_name}-{os.getpid()}.log"
     file_handler = logging.handlers.RotatingFileHandler(
-        LOG_DIR / f"{app_name}.log",
+        log_path,
         maxBytes=5 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -80,7 +94,7 @@ def setup_logging(app_name: str = "moles") -> logging.Logger:
 
     log = logging.getLogger("moles")
     log.info("=== %s started (pid %d, python %s) — logging to %s ===",
-             app_name, os.getpid(), sys.version.split()[0], LOG_DIR)
+             app_name, os.getpid(), sys.version.split()[0], log_path)
     return log
 
 
@@ -102,8 +116,34 @@ def install_qt_message_handler():
         QtCore.QtFatalMsg: logging.CRITICAL,
     }
 
+    # message -> [repeats_since_logged, monotonic time it may be logged again]
+    seen = {}
+    seen_lock = threading.Lock()
+
     def handler(mode, context, message):
-        qt_log.log(level_map.get(mode, logging.WARNING), message)
+        level = level_map.get(mode, logging.WARNING)
+        if level >= logging.CRITICAL:
+            qt_log.log(level, message)  # never throttle a fatal
+            return
+        now = time.monotonic()
+        with seen_lock:
+            if len(seen) > QT_MESSAGE_CACHE_MAX:
+                seen.clear()
+            state = seen.get(message)
+            if state is None:
+                seen[message] = [0, now + QT_MESSAGE_REPEAT_WINDOW_S]
+                repeats = 0
+            elif now >= state[1]:
+                repeats = state[0]
+                state[0] = 0
+                state[1] = now + QT_MESSAGE_REPEAT_WINDOW_S
+            else:
+                state[0] += 1
+                return
+        if repeats:
+            qt_log.log(level, "%s [+%d identical suppressed]", message, repeats)
+        else:
+            qt_log.log(level, message)
 
     QtCore.qInstallMessageHandler(handler)
 
@@ -137,11 +177,35 @@ def _install_exception_hooks():
 
 
 def get_gui_resource_counts():
-    """Return (gdi_count, user_count) for this process. Windows only."""
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    gdi = ctypes.windll.user32.GetGuiResources(handle, 0)   # GR_GDIOBJECTS
-    user = ctypes.windll.user32.GetGuiResources(handle, 1)  # GR_USEROBJECTS
-    return gdi, user
+    """Return (gdi_count, user_count) for this process. Windows only.
+
+    Needs a real process handle and declared argument types. The previous
+    version passed the ``GetCurrentProcess()`` pseudo-handle through an
+    undeclared ctypes prototype, where the 64-bit handle and the DWORD result
+    were both truncated to int: it returned ``(0, 0)`` on every call, so the
+    leak warning below could never fire and the counters in the log were
+    meaningless.
+    """
+    PROCESS_QUERY_INFORMATION = 0x0400
+    GR_GDIOBJECTS, GR_USEROBJECTS = 0, 1
+
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    user32.GetGuiResources.restype = ctypes.c_ulong
+    user32.GetGuiResources.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, os.getpid())
+    if not handle:
+        raise OSError(f"OpenProcess failed for pid {os.getpid()}")
+    try:
+        gdi = user32.GetGuiResources(handle, GR_GDIOBJECTS)
+        user = user32.GetGuiResources(handle, GR_USEROBJECTS)
+        return gdi, user
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _start_resource_monitor():

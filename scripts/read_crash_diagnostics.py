@@ -80,6 +80,16 @@ def main():
     print(f"tx_dropped      : {diag['tx_dropped']} (messages dropped, host not reading)")
     print(f"rx_overflow     : {diag['rx_overflow']} (command frames discarded)")
     print(f"starved_steps   : {diag['starved_steps']} (steps spent waiting for waveform data)")
+    if 'rejected_setpoints' in diag:
+        print(f"rejected_setpts : {diag['rejected_setpoints']} (corrupted waveform points refused; "
+              f"cell disconnected)")
+    if 'features' in diag:
+        print(f"late_steps      : {diag['late_steps']} (steps run >= 1 ms late; worst "
+              f"{diag['max_late_ms']} ms)")
+        print(f"resyncs         : {diag['resyncs']} (step schedule re-anchored after a stall)")
+        print(f"starve_aborts   : {diag['starve_aborts']} (runs ended, cell disconnected, "
+              f"because waveform data stopped arriving)")
+        print(f"features        : 0x{diag['features']:X}")
     print()
 
     if diag["watchdog_reset"]:

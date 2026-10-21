@@ -12,7 +12,6 @@ import logging
 import os
 import sys
 import threading
-import time
 from collections import deque
 
 import numpy as np
@@ -32,6 +31,7 @@ from ...driver.ps4_ref import (
 from ...logging_setup import install_qt_message_handler, setup_logging
 from ...session import connect_with_retry, emergency_cleanup
 from ...settings import get_show_electrolysis_plot_after_run
+from .guardian import Guardian
 from .table import (
     ALL_METHOD_COLS,
     COL_AC_DUTY,
@@ -63,7 +63,12 @@ from .table import (
 from ..scrollable_plots import PlotScrollArea, apply_scroll_height
 from .visualization_tab import VisualizationTab
 from .widgets import WaveformPreviewWidget
-from .workers import ElectrolysisSignals, ElectrolysisWorker, ReconnectWorker
+from .workers import (
+    DatasetLoadWorker,
+    ElectrolysisSignals,
+    ElectrolysisWorker,
+    ReconnectWorker,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -79,18 +84,58 @@ DRAIN_INTERVAL_MS = 100
 # Cap per-channel data buffered for the GUI; if the GUI stalls, old points are
 # dropped from the display (the CSV still receives every sample).
 DATA_BUFFER_MAXLEN = 20000
+# Ceiling on points one drain tick takes from a single channel. A tick with no
+# ceiling can outlast its own interval on a backlogged channel, and because the
+# backlog then keeps growing the event loop never regains control — the cause of
+# the 2026-09-17 multi-channel freeze. Bounding the tick keeps the UI alive and
+# lets a backlog drain over several ticks instead of one unbounded one.
+MAX_DRAIN_PER_CHANNEL = 500
 
-# ----- Hung-worker watchdog -----
-# Seconds after Stop before a non-responding worker is considered hung. Sized
-# beyond the worst case of two back-to-back 10 s serial read timeouts.
-WORKER_STOP_TIMEOUT_S = 25.0
-# After force-closing the port, seconds before the worker's UI slot is reaped.
-WORKER_REAP_TIMEOUT_S = 10.0
-WATCHDOG_POLL_MS = 5000
+# ----- Live plot refresh -----
+# Curves repaint on their own timer rather than once per incoming sample, so
+# plot cost can never be multiplied by the size of a data backlog.
+PLOT_REFRESH_MS = 250
+# Channels repainted per refresh tick, oldest-dirty first. A full 16-board grid
+# spreads its repaint over several ticks rather than blocking on one long one.
+PLOTS_PER_REFRESH = 4
+# Points drawn per curve: the newest RECENT_CURVE_POINTS samples at full
+# resolution plus the decimated earlier history, capped at MAX_CURVE_POINTS.
+# Without a cap the arrays handed to pyqtgraph grow with elapsed run time, so a
+# five-hour run costs several times what its first minute did.
+MAX_CURVE_POINTS = 2000
+RECENT_CURVE_POINTS = 1200
+
+# ----- Experiment worker pool -----
+# Experiment workers spend almost all their time asleep between 1 Hz samples, so
+# the pool is sized by how many boards a rig can hold, not by CPU count. Qt's
+# default (one thread per logical processor) silently queues the 13th experiment
+# on a 12-thread machine and it never starts.
+WORKER_POOL_SIZE = 32
+
+# ----- Guardian heartbeat -----
+# How often the GUI thread tells the guardian it is still alive. Must be well
+# under the guardian's staleness threshold so a healthy but busy event loop
+# isn't mistaken for a stalled one. The worker watchdogs themselves live in
+# guardian.py, on a thread a stalled event loop cannot take down.
+HEARTBEAT_MS = 1000
 
 # How often idle rows re-check the cross-process claim files to show which
 # boards other MOLES apps are currently using.
 CLAIMS_POLL_MS = 3000
+
+
+class GuardianSignals(QtCore.QObject):
+    """Carries the guardian thread's findings back onto the GUI thread.
+
+    The guardian deliberately knows nothing about Qt, but the user still has to
+    see what it did. These signals are emitted from the guardian thread and
+    delivered as queued events, so the slots run on the GUI thread whenever it
+    next gets around to them — and the hardware recovery never waits for that.
+    """
+    status = QtCore.pyqtSignal(object, str)    # pot_id, status text
+    reaped = QtCore.pyqtSignal(object)         # pot_id of an unrecoverable worker
+    never_started = QtCore.pyqtSignal(object)  # pot_id of a run that never began
+    emergency_stop = QtCore.pyqtSignal(int)    # experiments the stop file halted
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -114,7 +159,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.signals.finished.connect(self.on_process_finished)
         self.signals.status_updated.connect(self.on_status_updated)
 
-        self.threadpool = QtCore.QThreadPool.globalInstance()
+        # A private pool, so this window's long-lived experiment workers are
+        # never rationed against Qt's CPU-count default (see WORKER_POOL_SIZE).
+        self.threadpool = QtCore.QThreadPool(self)
+        self.threadpool.setMaxThreadCount(WORKER_POOL_SIZE)
 
         # Per-channel data buffers filled by workers and drained here on a
         # timer (replaces one queued signal per sample — see SignalQueue).
@@ -123,12 +171,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drain_timer.timeout.connect(self._drain_data_buffers)
         self._drain_timer.start(DRAIN_INTERVAL_MS)
 
-        # Watchdog for workers that fail to exit after a stop request
-        # (e.g. hung on a dead serial port). pot_id -> {'deadline', 'forced'}.
-        self._stop_watchdogs = {}
-        self._watchdog_timer = QtCore.QTimer(self)
-        self._watchdog_timer.timeout.connect(self._check_hung_workers)
-        self._watchdog_timer.start(WATCHDOG_POLL_MS)
+        # Channels whose curves hold undrawn samples. Draining only records the
+        # pid here; the repaint itself happens on its own slower timer so a data
+        # backlog cannot turn into a proportional pile of repaints.
+        self._dirty_plots = set()
+        self._dirty_order = deque()  # same pids, oldest-dirty first
+        self._plot_timer = QtCore.QTimer(self)
+        self._plot_timer.timeout.connect(self._refresh_dirty_plots)
+        self._plot_timer.start(PLOT_REFRESH_MS)
+
+        # Safety net that survives a stalled event loop: it force-closes the
+        # ports of workers hung after a stop request, cancels runs that never
+        # started, honours the emergency stop file, and dumps thread stacks if
+        # this GUI thread stops responding. See guardian.py for why none of
+        # that can live here.
+        self.guardian_signals = GuardianSignals()
+        self.guardian_signals.status.connect(self.on_status_updated)
+        self.guardian_signals.reaped.connect(self._on_worker_reaped)
+        self.guardian_signals.never_started.connect(self._on_worker_never_started)
+        self.guardian_signals.emergency_stop.connect(self._on_emergency_stop)
+        self.guardian = Guardian(
+            self.workers,
+            self.potentiostats,
+            on_status=self.guardian_signals.status.emit,
+            on_reaped=self.guardian_signals.reaped.emit,
+            on_never_started=self.guardian_signals.never_started.emit,
+            on_emergency_stop=self.guardian_signals.emergency_stop.emit,
+        )
+        self.guardian.start()
+
+        self._heartbeat_timer = QtCore.QTimer(self)
+        self._heartbeat_timer.timeout.connect(self.guardian.beat)
+        self._heartbeat_timer.start(HEARTBEAT_MS)
 
         # Reflect other apps' board claims ("In use: electroanalysis ...") in
         # the status column of idle rows.
@@ -163,7 +237,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ps_table.setColumnCount(len(TABLE_HEADERS))
         self.ps_table.setHorizontalHeaderLabels(TABLE_HEADERS)
         header = self.ps_table.horizontalHeader()
-        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        # Interactive, not ResizeToContents: auto-sizing re-measures every cell
+        # in the table on each data change, and the progress cells change once a
+        # second per running channel. Widths are set once from the populated
+        # rows instead (see _size_table_columns).
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
         self.ps_table.verticalHeader().setVisible(False)
         self.ps_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.ps_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -299,7 +377,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ----- "Electrolysis" tab: control panel (left) + live plot dock -----
         # The control UI and live plots live inside their own nested window so
         # the plot dock can be popped out (floated onto a second monitor) while
-        # staying scoped to this tab — switching to Data Visualization hides it.
+        # staying scoped to this tab — switching to Data Preview hides it.
         self.control_window = QtWidgets.QMainWindow()
         self.control_window.setCentralWidget(left_panel)
 
@@ -330,13 +408,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Approximate the old 3:4 splitter ratio at startup (1600 px window → ~900 px plots).
         self.control_window.resizeDocks([self.plot_dock], [900], QtCore.Qt.Horizontal)
 
-        # ----- "Data Visualization" tab: overlay & analyse finished runs -----
+        # ----- "Data Preview" tab: overlay & analyse finished runs -----
         self.viz_tab = VisualizationTab()
 
         # Outer tab widget holds the two workspaces side by side.
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.control_window, "Electrolysis")
-        self.tabs.addTab(self.viz_tab, "Data Visualization")
+        self.tabs.addTab(self.viz_tab, "Data Preview")
         self.setCentralWidget(self.tabs)
 
         # ----- Menu bar: View menu with a pop-out toggle for the plots -----
@@ -351,10 +429,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_dock.topLevelChanged.connect(self.pop_out_action.setChecked)
         view_menu.addAction(self.pop_out_action)
 
+        # Qt hides QAction tooltips in menus unless asked, and the emergency
+        # stop entry below is nothing but its explanation.
+        view_menu.setToolTipsVisible(True)
+        view_menu.addSeparator()
+        self.emergency_stop_action = QtWidgets.QAction("Emergency Stop File...", self)
+        self.emergency_stop_action.setToolTip(
+            "If this window ever stops responding, creating the file\n"
+            f"{self.guardian.stop_file}\n"
+            "stops every running experiment. A background thread watches for "
+            "it, so it works even when the window is frozen and the Stop "
+            "button is dead."
+        )
+        self.emergency_stop_action.triggered.connect(self._show_emergency_stop_help)
+        view_menu.addAction(self.emergency_stop_action)
+
         # Data & Plots Storage
         self.plots = {}             # pot_id -> dict with plot/curves
         self.plot_data = {}         # pot_id -> dict of buffers
-        self.last_plot_update = {}  # pot_id -> timestamp
+
+    def _show_emergency_stop_help(self):
+        """Show how to stop every experiment when the window is unresponsive."""
+        stop_file = self.guardian.stop_file
+        QtWidgets.QMessageBox.information(
+            self,
+            "Emergency Stop File",
+            "If this window freezes, the Stop Checked button and the window's "
+            "close handler stop working — but the experiments keep running.\n\n"
+            "Creating this file stops every running experiment:\n\n"
+            f"{stop_file}\n\n"
+            "A background thread checks for it every couple of seconds and is "
+            "unaffected by a frozen window. It deletes the file once it has "
+            "acted, so the next run is unaffected.\n\n"
+            "From a terminal:\n"
+            f"    Windows:  type nul > \"{stop_file}\"\n"
+            f"    macOS/Linux:  touch \"{stop_file}\"\n\n"
+            "Do NOT End-task a frozen window: that skips the hardware cleanup "
+            "and leaves every board driving current."
+        )
 
     # ----- Frozen ID column -----
 
@@ -478,6 +590,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.potentiostats[pid] = ps
                 self._ports[pid] = port
                 self.add_ps_ui(pid)
+            self._size_table_columns()
             self.status_label.setText(f"Created {len(mock_ports)} Mock devices.")
             return
 
@@ -515,6 +628,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText(
                 f"{board_count} board(s) listed. Ports open when an experiment starts."
             )
+        self._size_table_columns()
         self._refresh_claim_statuses()
 
         # Safety: Disable Test Mode if real hardware is listed
@@ -524,6 +638,29 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.test_mode_cb.setEnabled(True)
             self.test_mode_cb.setToolTip("")
+
+    # Widest text each live-updating column has to hold once a run is going.
+    # Sizing from the initial cell contents ("Idle", "—") would leave these two
+    # columns too narrow to read for the rest of the session.
+    _COL_WIDTH_SAMPLES = {
+        COL_STATUS: "WARNING: Serial read timeout (0/0)",
+        COL_PROGRESS: "0000.00 / 0000.00 C (100.0%)",
+    }
+
+    def _size_table_columns(self):
+        """Fit the columns to their contents once, after the rows are built.
+
+        Replaces per-change auto-sizing: the widths are computed here and then
+        left alone, so updating a progress cell no longer re-measures the table.
+        """
+        self.ps_table.resizeColumnsToContents()
+        metrics = QtGui.QFontMetrics(self.ps_table.font())
+        for col, sample in self._COL_WIDTH_SAMPLES.items():
+            if self.ps_table.isColumnHidden(col):
+                continue
+            needed = metrics.horizontalAdvance(sample) + 16  # cell padding
+            if self.ps_table.columnWidth(col) < needed:
+                self.ps_table.setColumnWidth(col, needed)
 
     def _refresh_claim_statuses(self):
         """Show which idle boards other MOLES apps are using right now.
@@ -686,7 +823,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'v': deque(maxlen=DISPLAY_BUFFER_SIZE),
             'history_t': [], 'history_i': [], 'history_v': [], 'history_counter': 0,
         }
-        self.last_plot_update[pid] = 0.0
         self._data_buffers[pid] = deque(maxlen=DATA_BUFFER_MAXLEN)
 
         # Grow the scrollable plot area to keep each plot legible (8 in view).
@@ -1001,6 +1137,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if menu.isEmpty():
             return
         chosen = menu.exec_(self.ps_table.viewport().mapToGlobal(pos))
+        # Parented to the window, so it would otherwise be kept alive (with its
+        # native popup) for the lifetime of the app, once per right-click.
+        menu.deleteLater()
         if chosen is None:
             return
         if chosen == edit_action:
@@ -1465,7 +1604,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'v': deque(maxlen=DISPLAY_BUFFER_SIZE),
             'history_t': [], 'history_i': [], 'history_v': [], 'history_counter': 0,
         }
-        self.last_plot_update[pid] = 0.0
         # Fresh buffer so leftovers from a previous run can't bleed into this one.
         self._data_buffers[pid] = deque(maxlen=DATA_BUFFER_MAXLEN)
 
@@ -1483,6 +1621,9 @@ class MainWindow(QtWidgets.QMainWindow):
             port=self._ports.get(pid, ""),
         )
         self.workers[pid] = worker
+        # A handed-off worker that never reports in has not run at all; the
+        # guardian releases the row instead of leaving it locked and silent.
+        self.guardian.arm_start(pid)
         self.threadpool.start(worker)
 
     def stop_checked(self):
@@ -1496,12 +1637,10 @@ class MainWindow(QtWidgets.QMainWindow):
             pid = self._row_pid(r)
             if pid in self.workers:
                 self.workers[pid].stop()
-                # Arm the watchdog: if the worker doesn't emit finished within
-                # the timeout, it is hung on the port and gets force-recovered.
-                self._stop_watchdogs[pid] = {
-                    'deadline': time.monotonic() + WORKER_STOP_TIMEOUT_S,
-                    'forced': False,
-                }
+                # Arm the guardian: if the worker doesn't emit finished within
+                # the timeout, it is hung on the port and gets force-recovered
+                # from a thread that a frozen event loop cannot take down.
+                self.guardian.arm_stop(pid)
                 stopped += 1
         if stopped == 0:
             self.status_label.setText("Checked potentiostats are not running.")
@@ -1573,6 +1712,7 @@ class MainWindow(QtWidgets.QMainWindow):
             chart.pop('is_ac', None)
             chart.pop('window_duration', None)
             chart.pop('duration_label', None)
+        self._dirty_plots.discard(pid)
 
         # Drop all buffered samples for this channel.
         self.plot_data[pid] = {
@@ -1581,7 +1721,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'v': deque(maxlen=DISPLAY_BUFFER_SIZE),
             'history_t': [], 'history_i': [], 'history_v': [], 'history_counter': 0,
         }
-        self.last_plot_update[pid] = 0.0
         self._data_buffers[pid] = deque(maxlen=DATA_BUFFER_MAXLEN)
 
         # If this is the currently-selected row, refresh the preview panel too.
@@ -1641,17 +1780,24 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _drain_data_buffers(self):
-        """Pull every pending data point from the worker buffers (GUI timer).
+        """Pull pending data points from the worker buffers (GUI timer).
 
         Plot buffers must see every point, but the table/label progress text
         only needs the most recent one — significant during AP bursts where a
         single drain can carry hundreds of points.
+
+        Each channel yields at most MAX_DRAIN_PER_CHANNEL points per tick. That
+        bound is what keeps the GUI thread returning to the event loop even when
+        a channel has fallen behind; anything still buffered waits for the next
+        tick rather than extending this one.
         """
         for pid, buf in self._data_buffers.items():
             if not buf:
                 continue
             data = None
-            while buf:
+            for _ in range(MAX_DRAIN_PER_CHANNEL):
+                if not buf:
+                    break
                 data = buf.popleft()
                 self._ingest_data_point(pid, data)
             self._update_progress_display(pid, data)
@@ -1686,64 +1832,107 @@ class MainWindow(QtWidgets.QMainWindow):
                 d['history_v'].append(d['v'][-1])
                 d['history_counter'] = 0
 
-        # Throttling Plot Update (10 Hz max for smoother AC visualization)
-        now = time.time()
-        if (now - self.last_plot_update.get(pid, 0)) > 0.1:
-            chart = self.plots[pid]
+        self._mark_plot_dirty(pid)
 
-            # Convert deques to lists once — deques don't support slice notation
-            t_buf = list(d['t'])
-            i_buf = list(d['i'])
-            v_buf = list(d['v'])
+    # ----- Live plot repaint (timer-driven, see PLOT_REFRESH_MS) -----
 
-            # Prepare Data for Plotting
-            if is_ac:
-                # Update Duration Label
-                if 'duration_label' in chart:
-                    chart['duration_label'].setText(f"Duration: {t:.1f}s")
-                    chart['plot'].setTitle(f"PS {pid} (Live) - T={t:.1f}s")
+    def _mark_plot_dirty(self, pid):
+        """Note that a channel has undrawn samples, without drawing anything."""
+        if pid not in self._dirty_plots:
+            self._dirty_plots.add(pid)
+            self._dirty_order.append(pid)
 
-                win_size = chart.get('window_duration', 1.0)
-                limit_t = t - win_size
-                subset_k = int(win_size * 30 + 100)
+    def _refresh_dirty_plots(self):
+        """Repaint a few channels that have undrawn samples (GUI timer).
 
-                times = t_buf[-subset_k:]
-                currs = i_buf[-subset_k:]
-                volts = v_buf[-subset_k:]
+        Only PLOTS_PER_REFRESH channels are redrawn per tick, oldest-dirty
+        first, so every channel is serviced in turn and no single tick has to
+        carry the repaint cost of a whole 16-board grid.
+        """
+        for _ in range(PLOTS_PER_REFRESH):
+            if not self._dirty_order:
+                return
+            pid = self._dirty_order.popleft()
+            if pid not in self._dirty_plots:
+                continue  # cleared or restarted since it went dirty
+            self._dirty_plots.discard(pid)
+            self._redraw_plot(pid)
 
-                # Keep only points within the rolling window
-                plot_t = []
-                plot_i = []
-                plot_v = []
-                for k in range(len(times)):
-                    if times[k] > limit_t:
-                        plot_t.append(times[k])
-                        plot_i.append(currs[k])
-                        plot_v.append(volts[k])
+    @staticmethod
+    def _decimate(xs, ys, budget):
+        """Thin two parallel series to at most ``budget`` points by even strides."""
+        if budget <= 0:
+            return [], []
+        if len(xs) <= budget:
+            return xs, ys
+        step = len(xs) // budget + 1
+        return xs[::step], ys[::step]
 
-                if 'i_curve' in chart and chart['i_curve']:
-                    chart['i_curve'].setData(plot_t, plot_i)
-                if 'v_curve' in chart and chart['v_curve']:
-                    chart['v_curve'].setData(plot_t, plot_v)
+    def _redraw_plot(self, pid):
+        """Push a channel's buffered samples into its two curves."""
+        d = self.plot_data.get(pid)
+        chart = self.plots.get(pid)
+        if d is None or chart is None or not d['t']:
+            return
+        # Deques don't slice, so materialise them as lists once.
+        t_all = list(d['t'])
+        i_all = list(d['i'])
+        v_all = list(d['v'])
 
-                chart['plot'].setXRange(limit_t, t, padding=0)
+        if chart.get('is_ac', False):
+            t = t_all[-1]
+            if 'duration_label' in chart:
+                chart['duration_label'].setText(f"Duration: {t:.1f}s")
+                chart['plot'].setTitle(f"PS {pid} (Live) - T={t:.1f}s")
 
-            else:
-                # DC: combine downsampled history with the high-res recent buffer.
-                # bisect finds the cutoff so history and deque don't overlap.
-                if t_buf and d['history_t']:
-                    n_hist = bisect.bisect_left(d['history_t'], t_buf[0])
-                    t_full = d['history_t'][:n_hist] + t_buf
-                    i_full = d['history_i'][:n_hist] + i_buf
-                    v_full = d['history_v'][:n_hist] + v_buf
-                else:
-                    t_full, i_full, v_full = t_buf, i_buf, v_buf
-                if 'i_curve' in chart and chart['i_curve']:
-                    chart['i_curve'].setData(t_full, i_full)
-                if 'v_curve' in chart and chart['v_curve']:
-                    chart['v_curve'].setData(t_full, v_full)
+            # Rolling window: times ascend, so its start is a slice point rather
+            # than a per-point comparison. Whatever falls inside the window is
+            # then thinned to the point budget, which is what keeps a wide
+            # window (a low AC frequency) from costing more than a narrow one.
+            win_size = chart.get('window_duration', 1.0)
+            limit_t = t - win_size
+            first = bisect.bisect_right(t_all, limit_t)
+            plot_t, plot_i = self._decimate(
+                t_all[first:], i_all[first:], MAX_CURVE_POINTS
+            )
+            _, plot_v = self._decimate(
+                t_all[first:], v_all[first:], MAX_CURVE_POINTS
+            )
+            if chart.get('i_curve'):
+                chart['i_curve'].setData(plot_t, plot_i)
+            if chart.get('v_curve'):
+                chart['v_curve'].setData(plot_t, plot_v)
+            chart['plot'].setXRange(limit_t, t, padding=0)
+            return
 
-            self.last_plot_update[pid] = now
+        # DC: the newest samples at full resolution, plus as much of the earlier
+        # history as the remaining budget allows. bisect finds the cutoff so the
+        # two halves don't overlap. Total point count is therefore flat over a
+        # long run instead of growing with it.
+        t_buf, i_buf, v_buf = (
+            t_all[-RECENT_CURVE_POINTS:],
+            i_all[-RECENT_CURVE_POINTS:],
+            v_all[-RECENT_CURVE_POINTS:],
+        )
+        if d['history_t']:
+            n_hist = bisect.bisect_left(d['history_t'], t_buf[0])
+            budget = MAX_CURVE_POINTS - len(t_buf)
+            hist_t, hist_i = self._decimate(
+                d['history_t'][:n_hist], d['history_i'][:n_hist], budget
+            )
+            _, hist_v = self._decimate(
+                d['history_t'][:n_hist], d['history_v'][:n_hist], budget
+            )
+            t_full = hist_t + t_buf
+            i_full = hist_i + i_buf
+            v_full = hist_v + v_buf
+        else:
+            t_full, i_full, v_full = t_buf, i_buf, v_buf
+
+        if chart.get('i_curve'):
+            chart['i_curve'].setData(t_full, i_full)
+        if chart.get('v_curve'):
+            chart['v_curve'].setData(t_full, v_full)
 
     def _update_progress_display(self, pid, data):
         """Update the row's progress cell + preview label from one data point."""
@@ -1780,6 +1969,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.charge_label.setText(f"Target: {limit_label}   |   {progress_text}")
 
     def on_status_updated(self, pot_id, status_msg):
+        # Any status at all proves the worker reached its own code.
+        self.guardian.disarm_start(pot_id)
         found_row = self._find_row_for_pid(pot_id)
         if found_row < 0:
             return
@@ -1804,7 +1995,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_process_finished(self, pid, success, msg, data_path):
         if pid in self.workers:
             del self.workers[pid]
-        self._stop_watchdogs.pop(pid, None)
+        self.guardian.disarm_stop(pid)
+        self.guardian.disarm_start(pid)
 
         # Update Table Status. On success the message is meaningful in the
         # status cell ("Completed" / "Stopped"); on failure show "Error" and
@@ -1827,68 +2019,85 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(f"PS {pid} Finished: {msg}")
         logger.info("[PS %s] Finished (success=%s): %s", pid, success, msg)
 
-        # Auto-load the finished run into the Data Visualization tab so it can be
+        # Auto-load the finished run into the Data Preview tab so it can be
         # overlaid and compared with other runs — unless the user disabled the
         # post-run plot in moles-settings.
-        if (
-            success
-            and data_path
-            and os.path.exists(data_path)
-            and get_show_electrolysis_plot_after_run()
-        ):
-            try:
-                self.viz_tab.add_dataset_from_file(data_path)
-            except Exception:
-                logger.exception("Failed to load run into Data Visualization")
+        #
+        # Both the existence check and the read happen on a worker: the data
+        # files live in a cloud-synced folder where either call can block for
+        # a long time, and a multi-hour run is tens of thousands of rows.
+        if success and data_path and get_show_electrolysis_plot_after_run():
+            loader = DatasetLoadWorker(data_path)
+            loader.signals.loaded.connect(self._on_dataset_loaded)
+            loader.signals.failed.connect(self._on_dataset_load_failed)
+            self.threadpool.start(loader)
 
-    def _check_hung_workers(self):
-        """Recover channels whose worker didn't exit after a stop request.
+    def _on_dataset_loaded(self, path, payload):
+        """Add a background-loaded run to the Data Preview tab."""
+        time_s, charge_c, metrics, method, mmol = payload
+        try:
+            self.viz_tab.add_dataset(
+                os.path.splitext(os.path.basename(path))[0],
+                time_s, charge_c, metrics, method, mmol,
+            )
+        except Exception:
+            logger.exception("Failed to add run to Data Preview")
 
-        Escalation: first force-close the serial port (which makes the
-        worker's blocked read/write raise and unblocks it into its normal
-        error path), then — if even that didn't produce a finished signal —
-        free the row and worker slot so the channel isn't locked until app
-        restart. The device must be reconnected before reuse either way.
+    def _on_dataset_load_failed(self, path, error):
+        logger.warning("Could not auto-load %s into Data Preview: %s", path, error)
+
+    def _on_worker_reaped(self, pid):
+        """Free the UI slot of a worker the guardian could not recover.
+
+        The guardian has already force-closed the port from its own thread;
+        this only undoes the UI side of a run that will never report finished,
+        so the channel isn't locked until the app restarts.
         """
-        now = time.monotonic()
-        for pid in list(self._stop_watchdogs):
-            if pid not in self.workers:
-                self._stop_watchdogs.pop(pid, None)
-                continue
-            state = self._stop_watchdogs[pid]
-            if now < state['deadline']:
-                continue
-            if not state['forced']:
-                logger.error("[PS %s] Worker unresponsive %.0fs after stop — force-closing port",
-                             pid, WORKER_STOP_TIMEOUT_S)
-                self.on_status_updated(pid, "WARNING: worker hung — forcing port closed")
-                ps = self.potentiostats.get(pid)
-                if ps is not None and hasattr(ps, 'force_close'):
-                    ps.force_close()
-                state['forced'] = True
-                state['deadline'] = now + WORKER_REAP_TIMEOUT_S
-            else:
-                logger.critical("[PS %s] Worker still hung after port close — freeing its UI slot",
-                                pid)
-                self.workers.pop(pid, None)
-                self._stop_watchdogs.pop(pid, None)
-                row = self._find_row_for_pid(pid)
-                if row >= 0:
-                    self._set_row_locked(row, False)
-                    if pid in self._live_edit_rows:
-                        self._live_edit_rows.discard(pid)
-                        self._paint_live_edit_row(row, False)
-                        self._update_apply_btn_state()
-                self.on_status_updated(pid, "Error: worker hung — reconnect before reuse")
-                self.status_label.setText(
-                    f"PS {pid} worker hung; its port was closed. Reconnect before reusing."
-                )
+        self.workers.pop(pid, None)
+        row = self._find_row_for_pid(pid)
+        if row >= 0:
+            self._set_row_locked(row, False)
+            if pid in self._live_edit_rows:
+                self._live_edit_rows.discard(pid)
+                self._paint_live_edit_row(row, False)
+                self._update_apply_btn_state()
+        self.on_status_updated(pid, "Error: worker hung — reconnect before reuse")
+        self.status_label.setText(
+            f"PS {pid} worker hung; its port was closed. Reconnect before reusing."
+        )
+
+    def _on_worker_never_started(self, pid):
+        """Free the row of a run the guardian cancelled before it ever began.
+
+        The guardian has already cancelled the worker, so it stays inert even
+        if the pool starts it later; this only undoes the UI side.
+        """
+        self.workers.pop(pid, None)
+        row = self._find_row_for_pid(pid)
+        if row >= 0:
+            self._set_row_locked(row, False)
+        self.on_status_updated(pid, "Error: never started — try again")
+        self.status_label.setText(
+            f"PS {pid} never started and was cancelled. Check the log, then retry."
+        )
+
+    def _on_emergency_stop(self, stopped):
+        """Report an emergency stop that the sentinel file triggered."""
+        if stopped:
+            self.status_label.setText(
+                f"EMERGENCY STOP file detected — stopping {stopped} experiment(s)."
+            )
+        else:
+            self.status_label.setText(
+                "EMERGENCY STOP file detected — no experiments were running."
+            )
 
     def closeEvent(self, event):
         # Stop all experiment threads, then run hardware cleanup in a background thread
         # so the GUI can close immediately without freezing on serial communication.
         for w in self.workers.values():
             w.stop()
+        self.guardian.shutdown()
         threading.Thread(target=emergency_cleanup, daemon=True).start()
         event.accept()
 

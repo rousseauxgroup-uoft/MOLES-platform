@@ -1,9 +1,9 @@
 """Top-level window for the unified MOLES electroanalysis interface.
 
 Four tabs sit side by side: a CV control tab, a DPV control tab, an OCP
-monitoring tab, and an Analysis tab. Every finished run is handed straight to
-the Analysis tab so a result can be inspected without reloading it from disk;
-the Analysis tab keeps voltammograms and OCP traces on separate plots, since
+monitoring tab, and a Data Preview tab. Every finished run is handed straight to
+the Data Preview tab so a result can be inspected without reloading it from disk;
+the Data Preview tab keeps voltammograms and OCP traces on separate plots, since
 they are read against different axes.
 """
 
@@ -38,10 +38,10 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.cv_tab, "Cyclic Voltammetry")
         tabs.addTab(self.dpv_tab, "Differential Pulse")
         tabs.addTab(self.ocp_tab, "Open Circuit Potential")
-        tabs.addTab(self.analysis_tab, "Analysis")
+        tabs.addTab(self.analysis_tab, "Data Preview")
         self.tabs = tabs
 
-        # Send finished runs to the Analysis tab automatically.
+        # Send finished runs to the Data Preview tab automatically.
         self.cv_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)
         self.dpv_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)
         self.ocp_tab.run_finished.connect(self.analysis_tab.add_dataset_from_file)

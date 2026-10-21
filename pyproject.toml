@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moles"
-version = "0.1.0"
+version = "0.1.1"
 description = "MOLES — Modular Open-source Laboratory for Electrochemistry Screening."
 authors = [
     { name = "Benjamin Chiu" },
@@ -21,8 +21,8 @@ dependencies = [
     "pyserial",
     "PyQt5",
     "pyqtgraph",
-    "opencv-python-headless",
     "pandas",
+    "XlsxWriter",
 ]
 
 classifiers = [
@@ -57,6 +57,7 @@ moles = ["py.typed", "resources/*.csv", "resources/*.png"]
 moles = "moles.ui.launcher.__main__:main"
 moles-electrolysis = "moles.ui.electrolysis.__main__:main"
 moles-electroanalysis = "moles.ui.electroanalysis.__main__:main"
+moles-data-analysis = "moles.ui.data_analysis.__main__:main"
 moles-onboard = "moles.ui.onboarding.__main__:main"
 moles-settings = "moles.ui.settings.__main__:main"
 

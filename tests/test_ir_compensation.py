@@ -9,61 +9,32 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from moles.driver.mock import MockPotentiostat
-from moles.driver.ps4_ref import (HW_VOLTAGE_COMPLIANCE_V, Potentiostat,
-                                  Resistors, SerialReadTimeout)
+from moles.driver.mock import MockLivePotentiostat, MockPotentiostat
+from moles.driver.ps4_ref import (FW_FEATURE_DAC_STEP, HW_VOLTAGE_COMPLIANCE_V,
+                                  RU_ADC_WINDOW_MS, RU_DAC_FIT_START_MS,
+                                  RU_FILTER_TAUS_MS, RU_MIN_BLANK_MS,
+                                  RU_PRE_SAMPLES, Potentiostat, Resistors,
+                                  SerialReadTimeout, _format_ms)
 
 
 # ----------------------------------------------------------------------
 # Driver: waveform, correction arithmetic, guards
 # ----------------------------------------------------------------------
 
-def _reference_waveform(min_V, max_V, cycles, step_V, start_V, last_V, direction):
-    """The waveform code as it was written inline in perform_CV, for comparison."""
-    cv = []
-    if direction == 'Positive':
-        first, turn_a, turn_b = max_V, min_V, max_V
-    else:
-        first, turn_a, turn_b = min_V, max_V, min_V
-    r1 = np.abs(first - start_V)
-    if r1 > 0:
-        cv = np.append(cv, np.linspace(start_V, first, int(np.round(r1 / step_V))))
-    p2 = np.linspace(first, turn_a, int(np.round(np.abs(turn_a - first) / step_V)))
-    p3 = np.linspace(turn_a, turn_b, int(np.round(np.abs(turn_b - turn_a) / step_V)))
-    for _ in range(cycles):
-        cv = np.append(cv, p2)
-        cv = np.append(cv, p3)
-    r4 = np.abs(last_V - turn_b)
-    if r4 > 0:
-        cv = np.append(cv, np.linspace(turn_b, last_V, int(np.round(r4 / step_V))))
-    return cv
-
-
-@pytest.mark.parametrize("direction", ['Negative', 'Positive'])
-@pytest.mark.parametrize("cycles", [1, 3])
-def test_build_cv_waveform_matches_original_inline_code(direction, cycles):
-    """The extraction out of perform_CV must not have changed the sweep."""
-    ref = _reference_waveform(-0.5, 0.8, cycles, 0.001, 0.0, 0.0, direction)
-    new = Potentiostat._build_cv_waveform(
-        None, -0.5, 0.8, cycles, 0.001, 0.0, 0.0, direction)
-    assert np.array_equal(np.asarray(ref, dtype=float), np.asarray(new, dtype=float))
-
-
-def test_build_cv_waveform_skips_zero_length_segments():
-    """Starting exactly at the first turning point drops the lead-in segment."""
-    with_lead = Potentiostat._build_cv_waveform(
-        None, -0.5, 0.5, 1, 0.001, 0.0, 0.0, 'Negative')
-    without_lead = Potentiostat._build_cv_waveform(
-        None, -0.5, 0.5, 1, 0.001, -0.5, -0.5, 'Negative')
-    assert len(without_lead) < len(with_lead)
-
-
 class _IRMock(MockPotentiostat):
     """Mock cell with the real iR methods grafted on, plus gain tracking."""
 
     _build_cv_waveform = Potentiostat._build_cv_waveform
     _fit_ru_decay = staticmethod(Potentiostat._fit_ru_decay)
+    _fit_ru_steps = staticmethod(Potentiostat._fit_ru_steps)
+    _fit_ru_step_response = staticmethod(Potentiostat._fit_ru_step_response)
+    _filtered_step_response = staticmethod(Potentiostat._filtered_step_response)
+    _ru_blank_ms = staticmethod(Potentiostat._ru_blank_ms)
+    _check_step_targets = Potentiostat._check_step_targets
+    _switch_step_traces = Potentiostat._switch_step_traces
+    _dac_step_traces = Potentiostat._dac_step_traces
     _acquire_step_trace = Potentiostat._acquire_step_trace
+    _quiet_wait = Potentiostat._quiet_wait
     measure_R_u = Potentiostat.measure_R_u
     perform_CV_iR = Potentiostat.perform_CV_iR
 
@@ -89,8 +60,9 @@ class _IRMock(MockPotentiostat):
         super().write_potential_calibrated(potential_V)
 
 
+# No quiet time: these tests look at the scan itself, not the hold before it
 CV_ARGS = dict(min_V=-0.2, max_V=0.2, cycles=1, mV_s=1000.0, step_hz=1000.0,
-               start_V=0.0, last_V=0.0)
+               start_V=0.0, last_V=0.0, quiet_s=0)
 
 # Disable the feedback guards so a test can check the correction arithmetic
 # itself: a 1-sample median with full weighting and no slew limit reproduces
@@ -203,7 +175,7 @@ def test_measure_r_u_restores_gain_settings():
     result = ps.measure_R_u(step_mV=50.0, n_readings=10, settle_s=0.0)
 
     # The legacy keys must survive alongside the fit diagnostics
-    assert {'R_u_ohm', 'fit_ok', 'message', 'polarities',
+    assert {'R_u_ohm', 'fit_ok', 'message', 'fit', 'polarities', 'control',
             'step_V', 'I_peak_A', 'times_ms', 'currents_A'} <= set(result)
     assert len(result['currents_A']) == 10
     assert ps.Resistor == Resistors.R_10K
@@ -280,36 +252,29 @@ def test_measure_r_u_prefers_the_firmware_capture():
 
 
 class _OffsetFwMock(_FwCaptureMock):
-    """Symmetric cell plus a constant +0.1 mA reading offset in the captured
-    traces only — the switch-open baseline read does not see it, as with a
+    """Symmetric cell plus a constant +0.1 mA reading offset in every capture
+    that the switch-open baseline read does not see, as with a
     calibration-intercept error the baseline reads share."""
 
     OFFSET_MA = 0.1
 
     def step_capture(self, n_samples, period_us):
         counts, dur, gain = super().step_capture(n_samples, period_us)
-        # The offset appears only after the control capture — modelling an
-        # offset the template subtraction cannot remove, which the combined
-        # estimator must still cancel.
-        if self.capture_calls >= 2:
-            counts = (counts.astype(np.int64)
-                      + int(self.OFFSET_MA * 10000)).astype(np.uint16)
+        counts = (counts.astype(np.int64)
+                  + int(self.OFFSET_MA * 10000)).astype(np.uint16)
         return counts, dur, gain
 
 
-def test_reading_offset_cancels_in_the_combined_estimate():
-    """A constant offset skews the two single-sided estimates in opposite
+def test_reading_offset_cancels_in_the_difference():
+    """A constant offset skews each step's own estimate in opposite
     directions (bench: 85 ohm reported where ~140 compensated best), but
-    cancels exactly in the difference of the two t=0 currents."""
+    cancels in the difference of the two traces."""
     ps = _OffsetFwMock()
     result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
 
     expected = 0.05 / ((ps.I0_MA + ps.RESIDUAL_MA) / 1000.0)
-    per_pol = sorted(p['R_u_ohm'] for p in result['polarities'])
-    assert per_pol[1] > 1.25 * per_pol[0]      # single-sided values skewed
-    assert result['fit_ok'] is True
+    assert result['fit_ok'] is True, result['message']
     assert result['R_u_ohm'] == pytest.approx(expected, rel=0.05)
-    assert "offset" in result['message']
 
 
 class _BaselineOffsetMock(_FwCaptureMock):
@@ -331,43 +296,83 @@ class _BaselineOffsetMock(_FwCaptureMock):
 
 
 def test_switch_open_baseline_is_subtracted_from_each_trace():
-    """The zero-current reading taken with the switch open must be removed
-    from the trace, making even the single-sided estimates come out right."""
+    """The zero-current reading taken with the switch open is removed from
+    every saved trace, so each settles on its own residual current."""
     ps = _BaselineOffsetMock()
     result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
 
     expected = 0.05 / ((ps.I0_MA + ps.RESIDUAL_MA) / 1000.0)
     for p in result['polarities']:
         assert p['baseline_A'] == pytest.approx(ps.OFFSET_MA / 1000.0, rel=1e-6)
-        assert p['R_u_ohm'] == pytest.approx(expected, rel=0.05)
+        assert abs(np.mean(p['currents_A'][-100:])) == pytest.approx(
+            ps.RESIDUAL_MA / 1000.0, rel=0.05)
     assert result['R_u_ohm'] == pytest.approx(expected, rel=0.05)
 
 
-class _ArtifactFwMock(_FwCaptureMock):
-    """A one-sample instrument spike rides on every capture, control
-    included — the structure the bench traces showed (0.565 mA first
-    sample against a ~0.2 mA transient)."""
+class _RecoveryFwMock(_FwCaptureMock):
+    """The amplifier's recovery from the switch closing as the bench traces
+    showed it (2026-09-27): ~0.5 mA in the first sample and some left in the
+    second, its sign following the way the amplifier was pushed, so the
+    zero-step control's differs from each step's."""
 
-    SPIKE_MA = 0.4
+    RECOVERY_MA = {1: (-0.49, -0.05), 2: (+0.45, +0.2), 3: (-0.53, -0.17)}
 
     def step_capture(self, n_samples, period_us):
         counts, dur, gain = super().step_capture(n_samples, period_us)
         counts = counts.astype(np.int64)
-        counts[0] += int(self.SPIKE_MA * 10000)
+        for k, extra in enumerate(self.RECOVERY_MA[self.capture_calls]):
+            counts[k] += int(extra * 10000)
         return counts.astype(np.uint16), dur, gain
 
 
-def test_switch_close_artifact_is_subtracted_via_the_control():
-    """The control capture measures the artifact with zero driving force;
-    subtracting it must leave both step fits on the true value instead of
-    the spike-dominated one."""
-    ps = _ArtifactFwMock()
+def test_switch_close_recovery_is_skipped_not_subtracted():
+    """Subtracting the control's recovery doubled it on the step of the other
+    sign, and that step's fit latched onto the spike ('decay too fast',
+    bench 2026-09-27); skipping the recovery leaves the true value."""
+    ps = _RecoveryFwMock()
     result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
 
     expected = 0.05 / ((ps.I0_MA + ps.RESIDUAL_MA) / 1000.0)
-    assert result['fit_ok'] is True
+    assert result['fit_ok'] is True, result['message']
     assert result['R_u_ohm'] == pytest.approx(expected, rel=0.05)
+    assert result['fit']['blank_ms'] == pytest.approx(RU_MIN_BLANK_MS)
+    # The saved control keeps its spike, for diagnosis
     assert float(np.max(np.abs(result['control']['currents_A']))) > 3e-4
+
+
+def _capture_times(n=6000, period_ms=0.025):
+    return (np.arange(n) + 0.5) * period_ms
+
+
+def test_recovery_length_is_read_off_the_control():
+    """The bench's two-sample recovery keeps the minimum skip; a slower one
+    extends it."""
+    t = _capture_times()
+    rng = np.random.default_rng(3)
+    quick = rng.normal(0, 4e-6, t.size)
+    quick[:2] += (-4.9e-4, -5.4e-5)
+    assert Potentiostat._ru_blank_ms(t, quick) == pytest.approx(RU_MIN_BLANK_MS)
+
+    slow = rng.normal(0, 4e-6, t.size) + 5e-4 * np.exp(-t / 0.05)
+    assert Potentiostat._ru_blank_ms(t, slow) > 0.1
+
+
+def test_a_recovery_longer_than_the_transient_is_refused():
+    t = _capture_times()
+    control = {'times_ms': t, 'currents_A': 5e-4 * np.exp(-t / 0.3),
+               'source': 'firmware'}
+    up = {'times_ms': t, 'currents_A': 2.7e-4 * np.exp(-t / 5.0), 'step_V': 0.05}
+    down = {'times_ms': t, 'currents_A': -2.7e-4 * np.exp(-t / 5.0), 'step_V': -0.05}
+    fit = Potentiostat._fit_ru_steps(up, down, control=control)
+    assert fit['ok'] is False
+    assert not np.isfinite(fit['R_u_ohm'])
+    assert "to settle" in fit['message']
+
+
+def test_short_durations_are_shown_in_microseconds():
+    """A 25 us sample interval once printed as '0.0 ms'."""
+    assert _format_ms(0.0224) == "22 µs"
+    assert _format_ms(2.5) == "2.5 ms"
 
 
 def test_ru_traces_are_saved_for_diagnosis(qapp, tmp_path, monkeypatch):
@@ -498,8 +503,9 @@ def test_fit_sees_a_transient_buried_in_a_long_capture():
 
 
 class _AsymFlatMock(_IRMock):
-    """Both polarities flat but wildly different — a faradaically active
-    cell whose transient is too fast to see, not a resistor."""
+    """Both steps flat and in their own directions, but 25-fold apart — a
+    faradaically active cell whose transient is too fast to see, not a
+    resistor."""
 
     _step_capture_supported = None
 
@@ -509,10 +515,7 @@ class _AsymFlatMock(_IRMock):
 
     def step_capture(self, n_samples, period_us):
         self.capture_calls += 1
-        if self.capture_calls == 1:      # zero-step control
-            i_mA = 0.0
-        else:
-            i_mA = 0.5 if self.capture_calls == 2 else 0.005
+        i_mA = {1: 0.0, 2: 0.5, 3: -0.02}[self.capture_calls]
         counts = np.full(n_samples, 32768 + int(i_mA * 10000), dtype=np.uint16)
         return counts, n_samples * period_us, 0
 
@@ -520,10 +523,10 @@ class _AsymFlatMock(_IRMock):
         return (np.asarray(counts, dtype=float) - 32768) / 10000.0
 
 
-def test_two_flat_polarities_that_disagree_are_refused():
-    """A genuine resistance is symmetric; asymmetric flat currents mean
-    sustained faradaic current and must not be averaged into a number
-    (bench 2026-08-14: 104 and 7803 ohm averaged to 3953)."""
+def test_steps_that_draw_very_different_currents_are_refused():
+    """A genuine resistance is symmetric; lopsided currents mean sustained
+    faradaic current and must not be turned into a number (bench 2026-08-14:
+    104 and 7803 ohm averaged to 3953)."""
     ps = _AsymFlatMock()
     result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
     assert result['fit_ok'] is False
@@ -531,9 +534,9 @@ def test_two_flat_polarities_that_disagree_are_refused():
     assert "faradaic" in result['message']
 
 
-class _MixedPolarityMock(_IRMock):
-    """One polarity shows a clean transient, the other only sustained
-    faradaic current."""
+class _WrongWayMock(_IRMock):
+    """The first step shows a clean transient; the second draws a small
+    current the wrong way, as in the tail of a faradaic wave."""
 
     _step_capture_supported = None
     TAU_MS = 5.0
@@ -547,10 +550,10 @@ class _MixedPolarityMock(_IRMock):
         t_ms = (np.arange(n_samples) + 0.5) * period_us / 1000.0
         if self.capture_calls == 1:      # zero-step control
             i_mA = np.zeros(n_samples)
-        elif self.capture_calls == 2:    # first polarity: real decay
+        elif self.capture_calls == 2:    # +50 mV: real decay
             i_mA = 0.25 * np.exp(-t_ms / self.TAU_MS) + 0.02
-        else:                            # second polarity: flat faradaic
-            i_mA = np.full(n_samples, 0.005)
+        else:                            # -50 mV: small, and positive
+            i_mA = np.full(n_samples, 0.02)
         counts = (32768 + i_mA * 10000.0).astype(np.uint16)
         return counts, n_samples * period_us, 0
 
@@ -558,12 +561,341 @@ class _MixedPolarityMock(_IRMock):
         return (np.asarray(counts, dtype=float) - 32768) / 10000.0
 
 
-def test_flat_polarity_is_ignored_when_the_other_fits():
-    ps = _MixedPolarityMock()
+def test_step_drawing_current_the_wrong_way_is_refused():
+    ps = _WrongWayMock()
     result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
-    assert result['fit_ok'] is True
-    assert result['R_u_ohm'] == pytest.approx(0.05 / 0.00027, rel=0.05)
-    assert "ignored" in result['message']
+    assert result['fit_ok'] is False
+    assert not np.isfinite(result['R_u_ohm'])
+    assert result['message'].startswith("the -50 mV step drew current against")
+
+
+class _SpikeOnlyMock(_WrongWayMock):
+    """The second step's only current is its recovery spike."""
+
+    def step_capture(self, n_samples, period_us):
+        if self.capture_calls == 2:          # about to take the second step
+            self.capture_calls += 1
+            i_mA = np.zeros(n_samples)
+            i_mA[0] = 0.25
+            counts = (32768 - i_mA * 10000.0).astype(np.uint16)
+            return counts, n_samples * period_us, 0
+        return super().step_capture(n_samples, period_us)
+
+
+def test_a_step_with_nothing_after_its_recovery_is_refused():
+    """Bench 2026-08-15: fits of such a step read 20-50 us 'time constants'
+    that were really the amplifier recovering."""
+    ps = _SpikeOnlyMock()
+    result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
+    assert result['fit_ok'] is False
+    assert not np.isfinite(result['R_u_ohm'])
+    assert ("-50 mV step drew" in result['message']
+            or "very different currents" in result['message'])
+
+
+def test_long_status_message_does_not_widen_the_panel(qapp):
+    """An unwrapped refusal message once stretched the CV panel ~1500 px wide,
+    and on macOS the iR box then centred its rows off-screen."""
+    from moles.ui.electroanalysis.widgets import PotentiostatPanel
+
+    panel = PotentiostatPanel('A', 'CV')
+    narrow = panel.minimumSizeHint().width()
+    panel.update_status("Error: " + "a long refusal message " * 20)
+    assert panel.minimumSizeHint().width() <= narrow + 10
+
+
+# ----------------------------------------------------------------------
+# R_u by DAC steps with the cell connected (firmware 1.7+)
+# ----------------------------------------------------------------------
+
+def _board_reading(t_ms, A, tau_ms, C, taus=RU_FILTER_TAUS_MS,
+                   window_ms=RU_ADC_WINDOW_MS):
+    """Exact reading of the cell current ``A*exp(-t/tau) + C`` (from t=0)
+    through first-order filters ``taus``, averaged over each ADC window:
+    partial fractions, independent of the driver's numerical model."""
+    t = np.asarray(t_ms, dtype=float)
+    b = [1.0 / x for x in taus]
+    gain = float(np.prod(b))
+
+    def terms(first_pole):
+        poles = [first_pole] + [-x for x in b]
+        out = []
+        for k, pk in enumerate(poles):
+            den = np.prod([pk - pj for j, pj in enumerate(poles) if j != k])
+            out.append((gain / den, pk))
+        return out
+
+    def averaged(r, p):
+        lo = np.clip(t - window_ms / 2, 0.0, None)
+        hi = t + window_ms / 2
+        if p == 0:
+            return r * (hi - lo) / window_ms
+        return r * (np.exp(p * hi) - np.exp(p * lo)) / (p * window_ms)
+
+    y = np.zeros_like(t)
+    for r, p in terms(-1.0 / tau_ms):
+        y += A * averaged(r, p)
+    for r, p in terms(0.0):
+        y += C * averaged(r, p)
+    return np.where(t > -window_ms / 2, y, 0.0)
+
+
+def _dac_step_trace(R, tau_ms, step_V, leak_A=0.0, noise_A=0.0, seed=0,
+                    centre_ms=0.005, n=6000):
+    rng = np.random.default_rng(seed)
+    t = (np.arange(n) - RU_PRE_SAMPLES) * 0.025 + centre_ms
+    i = _board_reading(t, step_V / R, tau_ms, leak_A)
+    return t, i + rng.normal(0.0, noise_A, n) if noise_A else i
+
+
+def test_step_response_model_matches_the_exact_filters():
+    t = np.linspace(-0.2, 1.0, 97)
+    exact = _board_reading(t, 2e-4, 0.3, 1e-5)
+    model = Potentiostat._filtered_step_response(np.clip(t, 0.0, None), 2e-4, 0.3, 1e-5)
+    model[t < -RU_ADC_WINDOW_MS / 2] = 0.0
+    assert np.max(np.abs(model - exact)) < 1e-3 * 2.1e-4
+
+
+@pytest.mark.parametrize("tau_ms", [0.1, 0.3, 0.7, 5.0])
+def test_dac_step_fit_sees_through_the_board_filters(tau_ms):
+    """The fit models the board's filters, so it recovers R_u whatever the
+    cell's time constant."""
+    t, i_up = _dac_step_trace(250.0, tau_ms, 0.05, leak_A=2e-5)
+    _, i_down = _dac_step_trace(250.0, tau_ms, -0.05, leak_A=-2e-5)
+    up = {'times_ms': t, 'currents_A': i_up, 'step_V': 0.05, 'pre_std_A': 0.0}
+    down = {'times_ms': t, 'currents_A': i_down, 'step_V': -0.05, 'pre_std_A': 0.0}
+    fit = Potentiostat._fit_ru_steps(up, down)
+    expected = 0.1 / (0.1 / 250.0 + 4e-5)
+    assert fit['ok'] is True, fit['message']
+    assert fit['R_u_ohm'] == pytest.approx(expected, rel=0.01)
+    assert fit['blank_ms'] == pytest.approx(RU_DAC_FIT_START_MS)
+
+
+def test_ignoring_the_filters_misreads_a_typical_cell():
+    """On a 0.3 ms cell a plain exponential reads R_u high when fitted from
+    30 us (the filtered rise drags it) and low from 100 us (the filters delay
+    the whole decay)."""
+    t, i_up = _dac_step_trace(250.0, 0.3, 0.05)
+    _, i_down = _dac_step_trace(250.0, 0.3, -0.05)
+    diff = i_up - i_down
+    early = (t >= RU_DAC_FIT_START_MS) & (t <= RU_DAC_FIT_START_MS + 1.0)
+    late = (t >= 0.1) & (t <= 1.1)
+    assert Potentiostat._fit_ru_decay(t[early], diff[early], 0.1)['R_u_ohm'] > 1.1 * 250.0
+    assert Potentiostat._fit_ru_decay(t[late], diff[late], 0.1)['R_u_ohm'] < 0.93 * 250.0
+
+
+def test_dac_step_on_a_plain_resistor():
+    t, i_up = _dac_step_trace(465.0, 1e9, 0.05, noise_A=4e-6, seed=1)
+    _, i_down = _dac_step_trace(465.0, 1e9, -0.05, noise_A=4e-6, seed=2)
+    up = {'times_ms': t, 'currents_A': i_up, 'step_V': 0.05, 'pre_std_A': 4e-6}
+    down = {'times_ms': t, 'currents_A': i_down, 'step_V': -0.05, 'pre_std_A': 4e-6}
+    fit = Potentiostat._fit_ru_steps(up, down)
+    assert fit['ok'] is True, fit['message']
+    assert fit['R_u_ohm'] == pytest.approx(465.0, rel=0.02)
+    assert "resistive" in fit['message']
+
+
+def test_dac_step_refuses_a_current_lost_in_the_noise():
+    """50 mV into ~10 kohm draws about one reading's noise on range 0."""
+    t, i_up = _dac_step_trace(9920.0, 1e9, 0.05, noise_A=4e-6, seed=3)
+    _, i_down = _dac_step_trace(9920.0, 1e9, -0.05, noise_A=4e-6, seed=4)
+    up = {'times_ms': t, 'currents_A': i_up, 'step_V': 0.05, 'pre_std_A': 4e-6}
+    down = {'times_ms': t, 'currents_A': i_down, 'step_V': -0.05, 'pre_std_A': 4e-6}
+    fit = Potentiostat._fit_ru_steps(up, down)
+    assert fit['ok'] is False
+    assert not np.isfinite(fit['R_u_ohm'])
+    assert "noise" in fit['message']
+
+
+class _DacStepMock(_IRMock):
+    """Firmware 1.7 board: DAC-step captures of a 250 ohm, 0.3 ms cell with
+    a small faradaic leak, riding on a +30 uA reading offset that the zero
+    before each step must remove."""
+
+    R, TAU_MS, LEAK_A, OFFSET_A = 250.0, 0.3, 1e-5, 3e-5
+
+    def __init__(self):
+        super().__init__()
+        self.captures = []
+
+    def firmware_features(self):
+        return FW_FEATURE_DAC_STEP
+
+    def read_ocp(self, restore_switch_state=True):
+        self._safe_open_switch()
+        return 0.123
+
+    def dac_step_capture(self, n_samples, period_us, n_pre, potential_V):
+        self.captures.append((n_samples, period_us, n_pre, potential_V,
+                              self._switch_state))
+        step_V = potential_V - 0.123
+        t = (np.arange(n_samples) - n_pre) * period_us / 1000.0 + 0.005
+        i_A = _board_reading(t, step_V / self.R, self.TAU_MS,
+                             np.sign(step_V) * self.LEAK_A) + self.OFFSET_A
+        counts = np.round(32768 + i_A * 1e3 * 10000.0).astype(np.uint16)
+        return counts, n_samples * period_us, 0, 5.0
+
+    def _capture_counts_to_mA(self, counts, gain_idx):
+        return (np.asarray(counts, dtype=float) - 32768) / 10000.0
+
+
+def test_measure_r_u_steps_the_dac_when_the_firmware_can():
+    ps = _DacStepMock()
+    ps.write_gain(Resistors.R_10K)
+    result = ps.measure_R_u(step_mV=50.0, settle_s=0.0)
+
+    assert result['control'] is None
+    assert [p['source'] for p in result['polarities']] == ['dac-step'] * 2
+    assert result['fit_ok'] is True, result['message']
+    expected = 0.1 / (0.1 / ps.R + 2 * ps.LEAK_A)
+    assert result['R_u_ohm'] == pytest.approx(expected, rel=0.01)
+    # Each capture started from rest at OCP with the cell already connected
+    targets = [c[3] for c in ps.captures]
+    assert targets == pytest.approx([0.173, 0.073])
+    assert all(c[2] == RU_PRE_SAMPLES and c[4] for c in ps.captures)
+    for p in result['polarities']:
+        assert p['baseline_A'] == pytest.approx(ps.OFFSET_A, abs=2e-7)
+    assert ps._switch_state is False
+    assert ps.Resistor == Resistors.R_10K
+
+
+class _FakeSerial:
+    """Records what the driver writes and plays back scripted reads."""
+
+    def __init__(self, reads):
+        self.reads = list(reads)
+        self.written = []
+        self.timeout = 1.0
+
+    def write(self, data):
+        self.written.append(bytes(data))
+
+    def read(self, n):
+        return self.reads.pop(0) if self.reads else b""
+
+    def reset_input_buffer(self):
+        pass
+
+
+def _dac_step_ack(captured, duration_us=150000, gain=0, centre_ns=4900):
+    return (np.uint32([captured, duration_us]).tobytes() + bytes([gain])
+            + np.uint32([centre_ns]).tobytes())
+
+
+def test_dac_step_capture_request_and_reply_on_the_wire():
+    ps = Potentiostat(serial_port='UNCONNECTED')
+    counts = np.arange(100, 106, dtype=np.uint16)
+    ps.serial = _FakeSerial([_dac_step_ack(6), counts.tobytes()])
+    got, duration_us, gain, centre_us = ps.dac_step_capture(6, 25, 2, 0.2)
+
+    req = ps.serial.written[0]
+    assert req[1] == 22 and len(req) == 18
+    assert list(np.frombuffer(req, np.uint32, 3, 2)) == [6, 25, 2]
+    expected_dac = float(ps._scale_input_voltages(
+        (0.2 - ps._calib_v_intercept) / ps._calib_v_slope))
+    assert np.frombuffer(req, np.float32, 1, 14)[0] == pytest.approx(expected_dac)
+    assert list(got) == list(counts)
+    assert (duration_us, gain, centre_us) == (150000, 0, pytest.approx(4.9))
+
+
+def test_dac_step_capture_refused_with_the_cell_disconnected():
+    ps = Potentiostat(serial_port='UNCONNECTED')
+    ps.serial = _FakeSerial([_dac_step_ack(0)])
+    with pytest.raises(RuntimeError, match="not connected"):
+        ps.dac_step_capture(6, 25, 2, 0.2)
+
+
+# ----------------------------------------------------------------------
+# Current tare: the open-circuit zero error is removed before a CV
+# ----------------------------------------------------------------------
+
+# Board P's registry read pair, and a raw reading that calibrates to the
+# +42 uA zero error its CVs showed (bench 2026-09-21).
+_P_READ = (1.07433, -0.621413)
+_P_ZERO_MA = 0.042
+
+
+def _tare_board(raw_mA=None):
+    """Unconnected driver with board P's calibration and a fixed raw reading."""
+    ps = Potentiostat(serial_port='UNCONNECTED')
+    ps.set_calibration_params(1.21331, 0.0283254, *_P_READ)
+    if raw_mA is None:
+        raw_mA = (_P_ZERO_MA - _P_READ[1]) / _P_READ[0]
+    ps.read_current = lambda: np.array([raw_mA / 1000.0])
+    return ps, raw_mA
+
+
+def test_tare_removes_the_open_circuit_zero_error():
+    ps, raw_mA = _tare_board()
+    assert ps.read_current_calibrated()[0] == pytest.approx(_P_ZERO_MA)
+
+    removed = ps.tare_current()
+    assert removed == pytest.approx(_P_ZERO_MA)
+    assert ps.read_current_calibrated()[0] == pytest.approx(0.0, abs=1e-9)
+    # The batch stream and the live loop's combined read share the intercept
+    assert ps.calibrate_batch_current_uA(raw_mA / 1000.0) == pytest.approx(0.0, abs=1e-6)
+    ps.read_potential_current = lambda: [0.1, raw_mA / 1000.0]
+    assert ps.read_potential_current_calibrated()[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_repeated_tares_replace_rather_than_stack():
+    ps, _ = _tare_board()
+    ps.tare_current()
+    intercept = ps._calib_read_intercept
+    assert ps.tare_current() == pytest.approx(_P_ZERO_MA)    # measured afresh
+    assert ps._calib_read_intercept == pytest.approx(intercept)
+
+
+def test_new_calibration_clears_the_tare():
+    ps, _ = _tare_board()
+    ps.tare_current()
+    ps.set_calibration_params(1.21331, 0.0283254, *_P_READ)
+    assert ps._current_tare_mA == 0.0
+    assert ps._calib_read_intercept == pytest.approx(_P_READ[1])
+
+
+def test_tare_takes_the_median_so_one_glitch_cannot_skew_it():
+    ps, raw_mA = _tare_board()
+    readings = iter([raw_mA / 1000.0] * 9 + [5.0e-3])
+    ps.read_current = lambda: np.array([next(readings)])
+    assert ps.tare_current() == pytest.approx(_P_ZERO_MA)
+
+
+def test_tare_refuses_a_connected_cell():
+    ps, _ = _tare_board()
+    ps._switch_state = True
+    with pytest.raises(RuntimeError):
+        ps.tare_current()
+
+
+class _ZeroErrorLive(MockLivePotentiostat):
+    """Test Mode device whose open-circuit reading shows a 42 uA zero error."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, chunk_delay_s=0, **kwargs)
+        self.tare_calls = 0
+
+    def tare_current(self, n_readings=10):
+        assert self._switch_state is False
+        self.tare_calls += 1
+        return _P_ZERO_MA
+
+
+def test_worker_tares_before_a_cv_and_records_it(window, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+    monkeypatch.setattr(workers, "MockLivePotentiostat", _ZeroErrorLive)
+
+    params = window.cv_tab._panels['A'].get_params()
+    worker = workers.VoltammetryWorker('A', 'MOCK_A', params, use_mock=True)
+    captured = {}
+    worker.signals.finished.connect(
+        lambda p, s, m, r, fp: captured.update(success=s, fp=fp))
+    worker.run()
+
+    assert captured['success'] is True
+    assert worker.ps.tare_calls == 1
+    params_text = Path(captured['fp']).with_suffix('.params.txt').read_text()
+    assert "current_zero_uA: 42.0" in params_text
 
 
 # ----------------------------------------------------------------------
@@ -853,12 +1185,135 @@ def test_posthoc_stream_and_file_share_the_corrected_axis(window, tmp_path):
 def test_ir_files_declare_the_corrected_column(window, tmp_path):
     captured, _ = _run_ir(window, tmp_path, 500.0)
     header = Path(captured['fp']).read_text().splitlines()[0]
-    assert "iR-corrected" in header
+    names = header.split(',')
+    assert "iR-corrected" in names[1]
     # A comma inside a column name would shift every column after it
-    assert len(header.split(',')) == 6
+    assert len(names) == 9
+    assert names[6:] == ["Potential measured (V)", "iR drop subtracted (V)", "Range"]
 
 
-def test_plain_cv_header_is_unchanged(window, tmp_path):
+@pytest.mark.parametrize("mode", ['posthoc', 'live'])
+def test_ir_files_keep_the_sensed_potential_for_recorrection(window, tmp_path, mode):
+    """An axis built from a wrong R_u must be repairable from the file alone
+    (bench 2026-09-21: a 621 ohm value on a ~460 ohm cell collapsed ΔEp)."""
+    R_u = 500.0
+    captured, _ = _run_ir(window, tmp_path, R_u, mode=mode)
+    data = np.genfromtxt(captured['fp'], delimiter=',', skip_header=1)
+    corrected, current_uA, sensed, drop = data[:, 1], data[:, 2], data[:, 6], data[:, 7]
+
+    assert np.allclose(drop, current_uA * 1e-6 * R_u, atol=2e-5)
+    assert np.allclose(sensed - drop, corrected, atol=2e-5)
+
+    # Rebuilding with a different R_u needs only the saved columns
+    better_R_u = 420.0
+    rebuilt = sensed - current_uA * 1e-6 * better_R_u
+    assert np.allclose(rebuilt - corrected,
+                       current_uA * 1e-6 * (R_u - better_R_u), atol=3e-5)
+
+
+def test_combine_ru_repeats_reports_the_median_of_agreeing_values():
+    from moles.ui.electroanalysis.workers import combine_ru_repeats
+    ok, R_u, note = combine_ru_repeats(
+        [{'R_u_ohm': v, 'fit_ok': True} for v in (455.0, 470.0, 460.0)])
+    assert ok is True
+    assert R_u == pytest.approx(460.0)
+    assert "455, 470, 460" in note
+
+
+def test_combine_ru_repeats_refuses_values_that_disagree():
+    """The bench spread (427-621 ohm) must be refused, not averaged."""
+    from moles.ui.electroanalysis.workers import combine_ru_repeats
+    ok, R_u, note = combine_ru_repeats(
+        [{'R_u_ohm': v, 'fit_ok': True} for v in (621.0, 496.0, 427.0)])
+    assert ok is False and R_u is None
+    assert "disagree" in note and "621" in note
+
+
+def test_combine_ru_repeats_passes_a_refusal_through():
+    from moles.ui.electroanalysis.workers import combine_ru_repeats
+    ok, R_u, note = combine_ru_repeats([
+        {'R_u_ohm': 460.0, 'fit_ok': True},
+        {'R_u_ohm': float('inf'), 'fit_ok': False,
+         'message': "decay too fast to extrapolate"}])
+    assert ok is False and R_u is None
+    assert note.startswith("Repeat 2 was refused") and "too fast" in note
+
+
+class _ScriptedRuMock(MockPotentiostat):
+    """Mock whose successive R_u measurements return scripted values."""
+
+    VALUES = (460.0, 455.0, 470.0)
+
+    def __init__(self, serial_port=None):
+        super().__init__(serial_port)
+        self.calls = 0
+
+    def measure_R_u(self, step_mV=50.0, n_readings=30, settle_s=2.0):
+        value = self.VALUES[self.calls]
+        self.calls += 1
+        ok = np.isfinite(value)
+        return {'R_u_ohm': value, 'fit_ok': ok,
+                'message': '' if ok else "decay too fast to extrapolate",
+                'polarities': []}
+
+
+def _run_ru_worker(monkeypatch, mock_cls):
+    import moles.ui.electroanalysis.workers as workers
+    made = []
+
+    def _factory(serial_port=None):
+        made.append(mock_cls(serial_port))
+        return made[-1]
+
+    monkeypatch.setattr(workers, "MockPotentiostat", _factory)
+    worker = workers.RuWorker('A', 'MOCK_A', use_mock=True)
+    captured = {}
+    worker.signals.finished.connect(
+        lambda p, ok, msg, r: captured.update(ok=ok, msg=msg, r_u=r))
+    worker.run()
+    return captured, made[0]
+
+
+def test_r_u_worker_repeats_and_reports_the_median(qapp, monkeypatch):
+    captured, ps = _run_ru_worker(monkeypatch, _ScriptedRuMock)
+    assert ps.calls == 3
+    assert captured['ok'] is True
+    assert captured['r_u'] == pytest.approx(460.0)
+    assert "median" in captured['msg']
+
+
+def test_r_u_worker_refuses_repeats_that_disagree(qapp, monkeypatch):
+    class _Scattered(_ScriptedRuMock):
+        VALUES = (621.0, 496.0, 427.0)
+
+    captured, _ = _run_ru_worker(monkeypatch, _Scattered)
+    assert captured['ok'] is False
+    assert captured['r_u'] is None
+    assert "disagree" in captured['msg']
+
+
+def test_r_u_worker_stops_at_the_first_refused_repeat(qapp, monkeypatch):
+    class _RefusedFirst(_ScriptedRuMock):
+        VALUES = (float('inf'), 460.0, 460.0)
+
+    captured, ps = _run_ru_worker(monkeypatch, _RefusedFirst)
+    assert ps.calls == 1                       # no further cell stepping
+    assert captured['ok'] is False
+    assert "too fast" in captured['msg']
+
+
+def test_repeat_traces_get_their_own_files(qapp, tmp_path, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+    monkeypatch.setattr(workers, "LOG_DIR", tmp_path)
+    result = _FwCaptureMock().measure_R_u(step_mV=50.0, settle_s=0.0)
+    worker = workers.RuWorker('A', 'MOCK_A', use_mock=True)
+    worker._save_traces(result, repeat=1)
+    worker._save_traces(result, repeat=2)
+    names = sorted(p.name for p in (tmp_path / "ru_traces").glob("RU_PS-A_*.csv"))
+    assert [n[-7:] for n in names] == ["_r1.csv", "_r2.csv"]
+
+
+def test_plain_cv_header_has_no_ir_columns(window, tmp_path):
     from moles.ui.electroanalysis.workers import VoltammetryWorker
 
     params = window.cv_tab._panels['A'].get_params()   # iR off by default
@@ -869,7 +1324,7 @@ def test_plain_cv_header_is_unchanged(window, tmp_path):
     worker.run()
 
     header = Path(captured['fp']).read_text().splitlines()[0]
-    assert header == "Time (s),Potential (V),Current (uA),Cycle,Index,Target V"
+    assert header == "Time (s),Potential (V),Current (uA),Cycle,Index,Target V,Range"
 
 
 def test_corrected_files_still_load_in_the_analysis_tab(window, tmp_path):

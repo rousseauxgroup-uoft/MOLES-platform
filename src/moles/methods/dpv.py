@@ -39,10 +39,13 @@ def cyclic_sweeps(min_V, max_V, cycles, direction='Positive',
     """Return the ``(from_V, to_V)`` leg list for a cyclic DPV run.
 
     Mirrors the cyclic-voltammetry sweep shape: the scan begins at ``start_V``,
-    heads to the first vertex, oscillates between ``min_V`` and ``max_V`` for
-    ``cycles`` full there-and-back cycles, then leaves the last vertex for
-    ``end_V``. ``direction`` sets the first move — ``'Positive'`` sweeps up to
-    the maximum first, ``'Negative'`` sweeps down to the minimum first.
+    heads to the first vertex, then the second, and repeats that vertex-to-
+    vertex sweep for ``cycles`` cycles before leaving the second vertex for
+    ``end_V``. One cycle visits each vertex once, so with ``start_V`` and
+    ``end_V`` equal the run is exactly ``cycles`` full round trips — no extra
+    cycle hides in the lead-in plus lead-out. ``direction`` sets the first
+    move — ``'Positive'`` sweeps up to the maximum first, ``'Negative'`` sweeps
+    down to the minimum first.
 
     ``min_V`` and ``max_V`` are ordered here, so which box holds which value does
     not matter. ``start_V`` and ``end_V`` default to that first vertex, giving a
@@ -51,17 +54,16 @@ def cyclic_sweeps(min_V, max_V, cycles, direction='Positive',
     twice. The result feeds straight into :func:`build_dpv_waveform`.
     """
     lo, hi = (min_V, max_V) if max_V >= min_V else (max_V, min_V)
-    # The vertex the scan heads to first and returns to each cycle; the far
-    # vertex is the turning point in between.
+    # The vertex the scan heads to first, and the one it turns back from.
     apex, far = (hi, lo) if direction == 'Positive' else (lo, hi)
     if start_V is None:
         start_V = apex
     if end_V is None:
         end_V = apex
 
-    points = [start_V, apex]
-    for _ in range(max(1, int(cycles))):
-        points += [far, apex]
+    points = [start_V, apex, far]
+    for _ in range(max(1, int(cycles)) - 1):
+        points += [apex, far]
     points.append(end_V)
 
     # Consecutive points become legs; drop any zero-length leg (a lead-in or
@@ -69,8 +71,17 @@ def cyclic_sweeps(min_V, max_V, cycles, direction='Positive',
     return [(a, b) for a, b in zip(points[:-1], points[1:]) if a != b]
 
 
+def _dac_codes(step_V, pulse_V, dac_grid):
+    """Step and pulse heights as whole numbers of DAC levels (the step at
+    least one level, so the staircase always moves)."""
+    spacing = dac_grid[0]
+    step_codes = max(1, int(np.round(abs(step_V) / spacing)))
+    pulse_codes = int(np.round(pulse_V / spacing))
+    return step_codes, pulse_codes
+
+
 def build_dpv_waveform(sweeps, pulse_V, step_V, potential_hold_ms,
-                       pulse_hold_ms, sample_hz):
+                       pulse_hold_ms, sample_hz, dac_grid=None):
     """Build the per-sample target-potential array for a DPV run.
 
     Each entry in ``sweeps`` is a ``(from_V, to_V)`` staircase; the sweeps run
@@ -84,6 +95,14 @@ def build_dpv_waveform(sweeps, pulse_V, step_V, potential_hold_ms,
     held for ``potential_hold_ms`` and each pulse for ``pulse_hold_ms``; a
     single trailing step-hold parks the DAC at the final level.
 
+    ``dac_grid`` — ``(spacing, offset)`` from the driver's ``dac_grid()`` —
+    places every level on a potential the DAC can actually produce. The DAC
+    moves in ~2.42 mV levels, so without it each level is rounded on its own
+    and a 50 mV pulse came out as 48.4 or 50.9 mV, and 5 mV steps as 4.8 or
+    7.3 mV (bench DPV, 2026-09-23). With it, every pulse is the same whole
+    number of levels, and every step too except the last of each sweep,
+    which lands exactly on the sweep's end potential.
+
     The result is laid out as consecutive (step-hold, pulse-hold) periods that
     line up exactly with :func:`process_dpv`, so acquisition and the
     differential analysis stay aligned.
@@ -95,20 +114,31 @@ def build_dpv_waveform(sweeps, pulse_V, step_V, potential_hold_ms,
         potential_hold_ms, pulse_hold_ms, sample_hz
     )
     step_V = abs(step_V) or 0.001  # guard against a zero step (flat staircase)
+    if dac_grid is not None:
+        spacing, offset = dac_grid
+        step_codes, pulse_codes = _dac_codes(step_V, pulse_V, dac_grid)
 
     pieces = []
     last_level = None
     for v_from, v_to in sweeps:
         direction = 1.0 if v_to >= v_from else -1.0
-        n_levels = max(2, int(np.round(abs(v_to - v_from) / step_V)))
-        levels = np.linspace(v_from, v_to, n_levels)
+        if dac_grid is None:
+            n_levels = max(2, int(np.round(abs(v_to - v_from) / step_V)))
+            levels = np.linspace(v_from, v_to, n_levels)
+            pulse = direction * pulse_V
+        else:
+            c_from = int(np.round((v_from - offset) / spacing))
+            c_to = int(np.round((v_to - offset) / spacing))
+            n_steps = max(1, int(np.round(abs(c_to - c_from) / step_codes)))
+            codes = c_from + direction * step_codes * np.arange(n_steps)
+            levels = offset + np.append(codes, c_to) * spacing
+            pulse = direction * pulse_codes * spacing
         # Drop the last level of each sweep: it becomes the first step of the
         # next sweep (cyclic), or the trailing park-hold (single / final sweep),
         # so no step is emitted twice at a turning point.
         for level in levels[:-1]:
             pieces.append(np.full(n_step, level, dtype=np.float32))
-            pieces.append(np.full(n_pulse, level + direction * pulse_V,
-                                  dtype=np.float32))
+            pieces.append(np.full(n_pulse, level + pulse, dtype=np.float32))
         last_level = levels[-1]
 
     if last_level is not None:
@@ -116,6 +146,27 @@ def build_dpv_waveform(sweeps, pulse_V, step_V, potential_hold_ms,
     if not pieces:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(pieces)
+
+
+def applied_dpv_settings(pulse_V, step_V, potential_hold_ms, pulse_hold_ms,
+                         sample_hz, dac_grid=None):
+    """What a DPV run really applies, for the record: the hold times after
+    rounding to whole samples, and — given ``dac_grid`` — the pulse and step
+    heights after snapping to whole DAC levels (see build_dpv_waveform).
+
+    Returns a dict with ``pulse_ms``, ``step_hold_ms``, ``pulse_V`` and
+    ``step_V``.
+    """
+    n_step, n_pulse, step_ms = samples_per_segment(
+        potential_hold_ms, pulse_hold_ms, sample_hz
+    )
+    applied = {'pulse_ms': n_pulse * step_ms, 'step_hold_ms': n_step * step_ms,
+               'pulse_V': float(pulse_V), 'step_V': float(abs(step_V) or 0.001)}
+    if dac_grid is not None:
+        step_codes, pulse_codes = _dac_codes(step_V, pulse_V, dac_grid)
+        applied['pulse_V'] = pulse_codes * dac_grid[0]
+        applied['step_V'] = step_codes * dac_grid[0]
+    return applied
 
 
 def process_dpv(potential, current, potential_hold_ms, pulse_hold_ms,
@@ -152,8 +203,13 @@ def process_dpv(potential, current, potential_hold_ms, pulse_hold_ms,
     if n_periods == 0:
         return np.empty((0, 2))
 
-    # Average at most as many points as the shorter segment can supply.
-    win = max(1, min(sample_window, n_step, n_pulse))
+    # Average at most as many points as the shorter segment can supply, and
+    # never a segment's first sample when it has others: on firmware that
+    # samples right after each setpoint is written, that sample is the
+    # charging spike of the potential edge, not the current being measured.
+    usable_step = n_step - 1 if n_step > 1 else 1
+    usable_pulse = n_pulse - 1 if n_pulse > 1 else 1
+    win = max(1, min(sample_window, usable_step, usable_pulse))
 
     out = np.empty((n_periods, 2))
     for k in range(n_periods):

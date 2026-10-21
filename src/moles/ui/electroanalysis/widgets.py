@@ -11,11 +11,44 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
-from .workers import IR_STEP_HZ
+from ...driver.ps4_ref import (DEFAULT_QUIET_S, IR_MAX_FRACTION, NOMINAL_DAC_STEP_V,
+                                RANGE_LABELS)
+from ...methods.dpv import applied_dpv_settings, samples_per_segment
+from .workers import CV_STEP_HZ, DPV_SAMPLE_HZ, IR_STEP_HZ
 
-# Step size above which an iR-compensated sweep is coarse enough to blur where
-# peaks sit, so the form warns about it.
+# Potential step per point above which a sweep (batched or iR-compensated) is
+# coarse enough to blur where peaks sit, so the form warns about it.
 IR_COARSE_STEP_MV = 5.0
+
+
+def _current_range_combo():
+    """The current-range choice shared by the CV and DPV forms. Its item data
+    is 'auto' or a fixed range index, as the driver's set_current_range takes."""
+    combo = QtWidgets.QComboBox()
+    combo.addItem("Auto (recommended)", 'auto')
+    for index, label in enumerate(RANGE_LABELS):
+        combo.addItem(label.replace('+/-', '\u00b1').replace(' uA', ' \u00b5A'), index)
+    combo.setToolTip(
+        "Auto moves between current ranges as the current changes, so small\n"
+        "currents are read on a sensitive range and large ones never clip.\n"
+        "Pick a fixed range to keep every run of a series identical, or for\n"
+        "fast scans and large electrodes, where each step's charging spike\n"
+        "would hold Auto on a less sensitive range. A fixed range cannot read\n"
+        "currents beyond its limit.")
+    return combo
+
+
+def _quiet_time_spin():
+    """The quiet-time input shared by the CV and DPV forms."""
+    spin = QtWidgets.QDoubleSpinBox()
+    spin.setRange(0.0, 600.0)
+    spin.setDecimals(1)
+    spin.setValue(DEFAULT_QUIET_S)
+    spin.setSuffix(" s")
+    spin.setToolTip(
+        "Time the cell is held at the first potential, connected, before the\n"
+        "scan starts, so the first points are not a switch-on transient.")
+    return spin
 
 
 class CVConfigWidget(QtWidgets.QWidget):
@@ -63,6 +96,12 @@ class CVConfigWidget(QtWidgets.QWidget):
         self.cycles = QtWidgets.QSpinBox()
         self.cycles.setRange(1, 100)
         self.cycles.setValue(3)
+        self.cycles.setToolTip(
+            "Number of full cycles between Min V and Max V.\n"
+            "One cycle visits each vertex once; after the last cycle the run\n"
+            "leaves the second vertex for Last V. With Start V = Last V, N cycles\n"
+            "is exactly N round trips."
+        )
         layout.addRow("Cycles:", self.cycles)
 
         self.scan_rate = QtWidgets.QDoubleSpinBox()
@@ -71,13 +110,19 @@ class CVConfigWidget(QtWidgets.QWidget):
         self.scan_rate.setSuffix(" mV/s")
         layout.addRow("Scan Rate:", self.scan_rate)
 
-        self.auto_gain_cb = QtWidgets.QCheckBox("Auto-Gain")
-        self.auto_gain_cb.setChecked(True)
-        self.auto_gain_cb.setToolTip(
-            "Enable automatic gain switching.\n"
-            "Disable if spikes or oscillations appear in the data."
-        )
-        layout.addRow("", self.auto_gain_cb)
+        # What each measured point really steps by, since the device takes a
+        # fixed number of points per second and moves in whole DAC levels
+        self.scan_note = QtWidgets.QLabel()
+        self.scan_note.setWordWrap(True)
+        layout.addRow("", self.scan_note)
+        self.scan_rate.valueChanged.connect(self._update_scan_note)
+        self._update_scan_note()
+
+        self.quiet_time = _quiet_time_spin()
+        layout.addRow("Quiet time:", self.quiet_time)
+
+        self.current_range = _current_range_combo()
+        layout.addRow("Current range:", self.current_range)
 
         # Solution resistance makes the electrode fall short of the potential
         # asked for, which spreads peaks apart. Correcting for it is off by
@@ -102,9 +147,11 @@ class CVConfigWidget(QtWidgets.QWidget):
         ru_row.addWidget(self.r_u)
         self.measure_ru_btn = QtWidgets.QPushButton("Measure")
         self.measure_ru_btn.setToolTip(
-            "Step the potential both ways from rest and fit the current "
-            "decay back to the instant of each step.\nTakes several seconds "
-            "and briefly energizes the cell."
+            "Step the potential both ways from rest and fit the difference "
+            "of the two current decays back to the instant of the step.\n"
+            "Repeated three times "
+            "and refused if the repeats disagree by more than 10%.\nTakes "
+            "about 20 seconds and briefly energizes the cell."
         )
         self.measure_ru_btn.clicked.connect(self.measure_ru_requested.emit)
         ru_row.addWidget(self.measure_ru_btn)
@@ -115,21 +162,24 @@ class CVConfigWidget(QtWidgets.QWidget):
         self.ir_mode.addItem("Live feedback (advanced correction)", 'live')
         self.ir_mode.setToolTip(
             "Post-hoc: run a normal batched CV, then subtract I x R_u from "
-            "the potential axis.\nLive: overshoot each setpoint by the "
-            "measured ohmic drop while the scan runs. Slower, runs at fixed gain, "
-            "and less forgiving of a wrong R_u."
+            "the potential axis.\nLive: add the ohmic drop back onto each "
+            "setpoint while the scan runs, so the electrode itself gets the "
+            "programmed sweep. Less forgiving of a wrong R_u.\nOn board "
+            "firmware 1.8+ the board does this itself; older firmware does it "
+            "from this computer, slower and on a fixed current range."
         )
         ir_form.addRow("Mode:", self.ir_mode)
 
         self.ir_percent = QtWidgets.QSpinBox()
-        self.ir_percent.setRange(0, 100)
+        self.ir_percent.setRange(0, int(round(IR_MAX_FRACTION * 100)))
         self.ir_percent.setValue(70)
         self.ir_percent.setSuffix(" %")
         self.ir_percent.setToolTip(
             "Live mode only: how much of the ohmic drop to add back during "
-            "the scan.\nWell below 100% on purpose; the correction uses a "
-            "positive feedback loop, and high values can lead to " \
-            "unstable potentiostat output."
+            "the scan.\nThe correction is positive feedback, one reading "
+            "behind, and turns unstable if it adds back more than the true "
+            "R_u; the 90% ceiling leaves room for an R_u measured a little "
+            "high."
         )
         ir_form.addRow("Apply:", self.ir_percent)
 
@@ -145,13 +195,34 @@ class CVConfigWidget(QtWidgets.QWidget):
         self.ir_mode.currentIndexChanged.connect(self._update_ir_note)
         self._update_ir_note()
 
+    def _update_scan_note(self):
+        """Show how far each measured point steps at this scan rate. Below one
+        DAC level per point the output still moves in whole levels, a few
+        points apart; above IR_COARSE_STEP_MV the steps blur peaks."""
+        step_mV = self.scan_rate.value() / CV_STEP_HZ
+        level_mV = NOMINAL_DAC_STEP_V * 1000.0
+        msg = f"≈ {step_mV:.2f} mV per point at {CV_STEP_HZ:g} points/s"
+        if step_mV < level_mV:
+            msg += (f"; the output moves in {level_mV:.1f} mV levels, one "
+                    f"every ~{level_mV / step_mV:.0f} points.")
+        else:
+            msg += "."
+        if step_mV > IR_COARSE_STEP_MV:
+            msg += (" Steps this coarse blur peak positions — lower the scan "
+                    "rate for quantitative work.")
+            self.scan_note.setStyleSheet("color: #b8860b; font-size: 11px;")
+        else:
+            self.scan_note.setStyleSheet("color: gray; font-size: 11px;")
+        self.scan_note.setText(msg)
+
     def _update_ir_note(self):
         """Explain what the selected compensation mode does and does not fix.
 
         Post-hoc corrects the recorded axis only, so the note says what that
-        is good for. Live mode sets and reads one point per serial round
-        trip, so its note shows the step size, which gets coarser as the
-        scan rate rises.
+        is good for. Live mode runs on the board with firmware 1.8+, at the
+        batched CV's point rate; with older firmware it sets and reads one
+        point per serial round trip, so the note also gives that fallback's
+        step size, which gets coarser as the scan rate rises.
         """
         self.ir_percent.setEnabled(self.ir_mode.currentData() == 'live')
         if not self.ir_box.isChecked():
@@ -165,11 +236,13 @@ class CVConfigWidget(QtWidgets.QWidget):
                 "feel the ohmic drop.")
             return
         step_mV = self.scan_rate.value() / IR_STEP_HZ
-        msg = (f"≈ {step_mV:.1f} mV steps at {IR_STEP_HZ:g} points/s, "
-               f"fixed gain.")
+        msg = (f"The board adds the drop back at {CV_STEP_HZ:g} points/s "
+               f"(firmware 1.8+). Older firmware: this computer does it, "
+               f"≈ {step_mV:.1f} mV steps at {IR_STEP_HZ:g} points/s, "
+               f"fixed range.")
         if step_mV > IR_COARSE_STEP_MV:
-            msg += (" Steps this coarse blur peak positions — lower the scan "
-                    "rate for quantitative work.")
+            msg += (" On older firmware, steps this coarse blur peak "
+                    "positions — lower the scan rate for quantitative work.")
             self.ir_note.setStyleSheet("color: #b8860b; font-size: 11px;")
         else:
             self.ir_note.setStyleSheet("color: gray; font-size: 11px;")
@@ -196,7 +269,8 @@ class CVConfigWidget(QtWidgets.QWidget):
             'scan_direction': self.direction_combo.currentText(),
             'cycles': self.cycles.value(),
             'mV_s': self.scan_rate.value(),
-            'auto_gain': self.auto_gain_cb.isChecked(),
+            'quiet_time_s': self.quiet_time.value(),
+            'current_range': self.current_range.currentData(),
             'ir_enabled': self.ir_box.isChecked(),
             'ir_mode': self.ir_mode.currentData(),
             'R_u_ohm': self.r_u.value(),
@@ -451,7 +525,9 @@ class DPVConfigWidget(QtWidgets.QWidget):
         self.cycles.setValue(1)
         self.cycles.setToolTip(
             "Number of full cycles between Min V and Max V.\n"
-            "One cycle returns to the first vertex before the run leaves for End V."
+            "One cycle visits each vertex once; after the last cycle the run\n"
+            "leaves the second vertex for End V. With Start V = End V, N cycles\n"
+            "is exactly N round trips."
         )
         cyclic_form.addRow("Cycles:", self.cycles)
         layout.addRow(self.cyclic_box)
@@ -469,25 +545,37 @@ class DPVConfigWidget(QtWidgets.QWidget):
         self.step_v.setValue(0.005)
         layout.addRow("Step Height (V):", self.step_v)
 
+        # Widths are whole samples of the DPV clock: the form steps by one
+        # sample and rounds typed values to one, so it shows what will run
+        # (a typed 50 ms pulse always ran as 48 ms)
+        sample_ms = samples_per_segment(1, 1, DPV_SAMPLE_HZ)[2]
         self.pulse_width = QtWidgets.QSpinBox()
-        self.pulse_width.setRange(1, 5000)
-        self.pulse_width.setValue(50)
+        self.pulse_width.setRange(sample_ms, 5000)
+        self.pulse_width.setSingleStep(sample_ms)
+        self.pulse_width.setValue(48)
         self.pulse_width.setSuffix(" ms")
         layout.addRow("Pulse Width:", self.pulse_width)
 
         self.step_width = QtWidgets.QSpinBox()
-        self.step_width.setRange(1, 5000)
+        self.step_width.setRange(sample_ms, 5000)
+        self.step_width.setSingleStep(sample_ms)
         self.step_width.setValue(200)
         self.step_width.setSuffix(" ms")
         layout.addRow("Step Width:", self.step_width)
+        for spin in (self.pulse_width, self.step_width):
+            spin.editingFinished.connect(self._snap_widths)
 
-        self.auto_gain_cb = QtWidgets.QCheckBox("Auto-Gain")
-        self.auto_gain_cb.setChecked(True)
-        self.auto_gain_cb.setToolTip(
-            "Enable automatic gain switching.\n"
-            "Disable if spikes or oscillations appear in the data."
-        )
-        layout.addRow("", self.auto_gain_cb)
+        self.quiet_time = _quiet_time_spin()
+        layout.addRow("Quiet time:", self.quiet_time)
+
+        # The heights and widths the hardware will really apply
+        self.applied_note = QtWidgets.QLabel()
+        self.applied_note.setWordWrap(True)
+        self.applied_note.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addRow("", self.applied_note)
+
+        self.current_range = _current_range_combo()
+        layout.addRow("Current range:", self.current_range)
 
         # Live preview of the pulse waveform, redrawn whenever a value changes.
         self.preview = DPVWaveformPreview()
@@ -526,6 +614,29 @@ class DPVConfigWidget(QtWidgets.QWidget):
             v_from, v_to, self.step_v.value(), self.pulse_v.value(),
             self.step_width.value(), self.pulse_width.value(),
         )
+        self._update_applied_note()
+
+    def _snap_widths(self):
+        """Round the pulse and step widths to whole samples of the DPV clock,
+        the same rounding the run applies."""
+        n_step, n_pulse, sample_ms = samples_per_segment(
+            self.step_width.value(), self.pulse_width.value(), DPV_SAMPLE_HZ)
+        self.step_width.setValue(n_step * sample_ms)
+        self.pulse_width.setValue(n_pulse * sample_ms)
+
+    def _update_applied_note(self):
+        """State the pulse and step the hardware will really apply: heights
+        in whole DAC levels (a board's own calibration can shift them by
+        ~1 %), widths in whole samples."""
+        applied = applied_dpv_settings(
+            self.pulse_v.value(), self.step_v.value(), self.step_width.value(),
+            self.pulse_width.value(), DPV_SAMPLE_HZ,
+            dac_grid=(NOMINAL_DAC_STEP_V, 0.0))
+        self.applied_note.setText(
+            f"Applied: ≈ {applied['pulse_V'] * 1000:.1f} mV pulses of "
+            f"{applied['pulse_ms']} ms on ≈ {applied['step_V'] * 1000:.1f} mV "
+            f"steps of {applied['step_hold_ms']} ms — the output moves in "
+            f"{NOMINAL_DAC_STEP_V * 1000:.2f} mV levels.")
 
     def get_params(self):
         """Return the DPV experiment parameters as a dict.
@@ -546,7 +657,8 @@ class DPVConfigWidget(QtWidgets.QWidget):
             'step_V': self.step_v.value(),
             'pulse_duration': self.pulse_width.value(),
             'p_hold': self.step_width.value(),
-            'auto_gain': self.auto_gain_cb.isChecked(),
+            'quiet_time_s': self.quiet_time.value(),
+            'current_range': self.current_range.currentData(),
         }
         if self.type_combo.currentText() == "Cyclic":
             params.update({
@@ -645,9 +757,6 @@ class OCPConfigWidget(QtWidgets.QWidget):
             'name': self.name_edit.text() or "OCP",
             'duration_s': self._duration_s(),
             'sample_hz': self.sample_hz.value(),
-            # No current flows through a disconnected cell, so there is nothing
-            # for auto-gain to range on; a fixed gain keeps the link quiet.
-            'auto_gain': False,
         }
 
 
@@ -682,6 +791,10 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
 
         self.status_label = QtWidgets.QLabel("Status: Idle")
         self.status_label.setStyleSheet("color: gray;")
+        # Without wrapping, a long error message sets the whole panel's
+        # minimum width; on macOS the iR form then centres its rows in that
+        # width, off-screen, and the box looks empty.
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         self.config = _CONFIG_WIDGETS[method]()
@@ -748,7 +861,7 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
         self.run_btn.setEnabled(False)
         self.stop_btn.setVisible(True)
         self.stop_btn.setEnabled(True)
-        self.status_label.setText("Status: Starting...")
+        self.status_label.setText("Status: Preparing...")
         self.status_label.setStyleSheet("color: blue;")
 
     def _on_stop(self):
@@ -785,7 +898,7 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
             self.stop_btn.setEnabled(True)
             if "Error" in msg:
                 self.status_label.setStyleSheet("color: red;")
-            elif "Stopped" in msg:
+            elif "Stopped" in msg or "problems" in msg:
                 self.status_label.setStyleSheet("color: orange;")
             else:
                 self.status_label.setStyleSheet("color: green;")

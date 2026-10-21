@@ -1,0 +1,147 @@
+# Builds the MOLES installers for Windows and macOS, test-installs each one on
+# a fresh GitHub machine, and (for version tags) attaches them to a draft
+# GitHub Release.
+#
+#   - Release: set `version` in pyproject.toml, commit, then push a matching
+#     tag (version 0.2.0 -> tag v0.2.0). When this finishes, open the repo's
+#     Releases page, check the draft and its notes, and click Publish. The
+#     launcher only offers updates from published releases.
+#   - Test build without releasing: Actions tab -> "Build installers" ->
+#     "Run workflow". The installers appear under the run's Artifacts.
+name: Build installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # uv is the tool the installers use to download Python and the packages.
+  UV_VERSION: "0.10.8"
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MOLES version $version"
+      - name: Check the tag matches that version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ "${GITHUB_REF_NAME#v}" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version ${{ steps.version.outputs.version }} in pyproject.toml"
+            exit 1
+          fi
+      - name: Build the MOLES wheel
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --wheel --outdir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  windows:
+    needs: wheel
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.wheel.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: installer/windows/stage
+      - name: Fetch uv
+        shell: pwsh
+        run: |
+          $url = "https://github.com/astral-sh/uv/releases/download/$env:UV_VERSION/uv-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest $url -OutFile uv.zip
+          Expand-Archive uv.zip -DestinationPath uv
+          Copy-Item uv\uv.exe installer\windows\stage\
+      - name: Build MOLES-Setup.exe
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --yes --no-progress }
+          & $iscc "/DAppVersion=$env:VERSION" "/DStageDir=stage" installer\windows\moles.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test-install it
+        shell: pwsh
+        run: |
+          Start-Process "dist\MOLES-Setup-$env:VERSION.exe" -Wait `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=setup.log"
+          $app = "$env:LOCALAPPDATA\Programs\MOLES"
+          Get-Content "$app\install-log.txt" -Tail 15
+          & "$app\runtime\python.exe" -c "import moles, moles.updates as u; assert u.installed_by_installer(); print('MOLES', moles.__version__, 'installed')"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path "$app\runtime\pythonw.exe")) { throw "pythonw.exe missing" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/MOLES-Setup-*.exe
+
+  macos:
+    needs: wheel
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.wheel.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: stage
+      - name: Build MOLES.pkg
+        run: |
+          installer/macos/fetch_uv.sh "$UV_VERSION" stage/uv
+          installer/macos/build_pkg.sh "$VERSION" stage/moles-*.whl stage/uv
+      - name: Test-install it (Apple Silicon)
+        run: installer/macos/test_install.sh "dist/MOLES-$VERSION.pkg" arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/MOLES-*.pkg
+
+  macos-intel:
+    needs: [wheel, macos]
+    runs-on: macos-15-intel
+    env:
+      VERSION: ${{ needs.wheel.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-installer
+          path: dist
+      - name: Test-install the same package (Intel)
+        run: installer/macos/test_install.sh "dist/MOLES-$VERSION.pkg" x86_64
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel, windows, macos, macos-intel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-installer"
+          merge-multiple: true
+          path: dist
+      - name: Create a draft release with both installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --draft \
+            --title "MOLES ${{ needs.wheel.outputs.version }}" \
+            --notes "Download **MOLES-Setup-${{ needs.wheel.outputs.version }}.exe** for Windows or **MOLES-${{ needs.wheel.outputs.version }}.pkg** for macOS. See the README for installation steps."

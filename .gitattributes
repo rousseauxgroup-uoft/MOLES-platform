@@ -1,0 +1,6 @@
+# Windows runs .cmd files with Windows line endings only.
+*.cmd text eol=crlf
+*.iss text eol=crlf
+*.sh text eol=lf
+installer/macos/MOLES text eol=lf
+installer/macos/scripts/* text eol=lf

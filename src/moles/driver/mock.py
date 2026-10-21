@@ -4,7 +4,9 @@ import numpy as np
 import random
 import threading
 
-from .ps4_ref import SerialReadTimeout
+from .ps4_ref import (AMP_FULL_SCALE_V, DEFAULT_QUIET_S, NOMINAL_DAC_STEP_V,
+                      RANGE_OHMS, SerialReadTimeout, build_cv_waveform,
+                      cv_cycle_numbers)
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,10 @@ class MockLivePotentiostat:
         # When the fake cell was first left at open circuit, so its resting
         # potential can relax with time (see _synth_ocp).
         self._ocp_t0 = None
+        # Same shape as the real driver's report of its last batched run
+        self.last_batch_report = None
+        self.last_batch_ranges = None
+        self._current_range = 0
 
     # --- Connection / configuration no-ops (match the real interface) ---
 
@@ -377,7 +383,13 @@ class MockLivePotentiostat:
         self._switch_state = bool(state)
 
     def write_gain(self, resistor=0):
-        pass
+        self._current_range = int(resistor)
+
+    def set_current_range(self, current_range):
+        """Like the real driver on firmware with auto-ranging: returns 'auto'
+        or the fixed range index the run will use."""
+        self._current_range = current_range if current_range == 'auto' else int(current_range)
+        return self._current_range
 
     def write_auto_gain(self, state=False):
         self._auto_gain = bool(state)
@@ -416,6 +428,40 @@ class MockLivePotentiostat:
     def set_voltage_calibration_params(self, slope, intercept, read_slope=None, read_intercept=None):
         pass
 
+    def tare_current(self, n_readings=10):
+        """The synthetic currents have no zero error, so there is nothing to
+        remove — returned as 0 mA, matching the real driver's return."""
+        return 0.0
+
+    def dac_grid(self):
+        """The real driver's DAC levels for a board with no stored voltage
+        calibration: (spacing, offset) in volts."""
+        return NOMINAL_DAC_STEP_V, -5.0 * 0.9919 + 0.0494
+
+    def _report_batch(self, n_points, step_ms, currents_uA=None):
+        """Leave a clean run report, as the real driver does after a batch.
+
+        An auto-ranged run puts each point on the most sensitive range its
+        current fits comfortably, as the firmware would."""
+        auto = self._current_range == 'auto'
+        if auto and currents_uA is not None:
+            reach_uA = AMP_FULL_SCALE_V / np.asarray(RANGE_OHMS) * 1e6 * 0.8
+            fits = np.abs(np.asarray(currents_uA))[:, None] < reach_uA[None, :]
+            ranges = np.where(fits.any(axis=1), len(RANGE_OHMS) - 1 - np.argmax(fits[:, ::-1], axis=1), 0)
+        else:
+            ranges = np.full(n_points, 0 if auto else self._current_range, dtype=int)
+        self.last_batch_ranges = ranges.astype(int)
+        self.last_batch_report = {
+            'points': int(n_points), 'sample_at_end': True,
+            'step_ms_nominal': float(step_ms), 'step_ms_measured': None,
+            'time_axis': 'nominal', 'auto_range': auto, 'lead_in_points': 0,
+            'ranges_used': sorted(int(r) for r in np.unique(ranges)),
+            'range_changes': int(np.count_nonzero(np.diff(ranges))),
+            'saturated_points': 0, 'health': {}, 'degraded': [],
+        }
+        # Samples are taken at the end of each step, one period after it began
+        return (np.arange(n_points) + 1) * step_ms / 1000.0
+
     # --- Streaming helper ---
 
     def _stream(self, potentials, currents_uA):
@@ -451,28 +497,13 @@ class MockLivePotentiostat:
         if last_V is None:
             last_V = 0.0
 
-        V_s = mV_s / 1000.0
-        step_V = max(V_s / step_hz, 1e-4)
-
-        sweep = []
-        if scan_direction == 'Positive':
-            first, turn_a, turn_b = max_V, min_V, max_V
-        else:
-            first, turn_a, turn_b = min_V, max_V, min_V
-
-        r1 = abs(first - start_V)
-        if r1 > 0:
-            sweep = np.append(sweep, np.linspace(start_V, first, int(np.round(r1 / step_V))))
-        leg_a = np.linspace(first, turn_a, max(2, int(np.round(abs(turn_a - first) / step_V))))
-        leg_b = np.linspace(turn_a, turn_b, max(2, int(np.round(abs(turn_b - turn_a) / step_V))))
-        for _ in range(cycles):
-            sweep = np.append(sweep, leg_a)
-            sweep = np.append(sweep, leg_b)
-        r4 = abs(last_V - turn_b)
-        if r4 > 0:
-            sweep = np.append(sweep, np.linspace(turn_b, last_V, int(np.round(r4 / step_V))))
-
-        applied = np.asarray(sweep, dtype=float)
+        # Same step as the real driver (sized for the whole-millisecond rate
+        # the device really runs), floored so Test Mode stays quick at very
+        # slow scan rates
+        delay_ms = max(1, int(np.round(1000 / step_hz)))
+        step_V = max((mV_s / 1000.0) / (1000.0 / delay_ms), 1e-4)
+        applied = build_cv_waveform(min_V, max_V, cycles, step_V, start_V,
+                                    last_V, scan_direction)
         n = len(applied)
 
         # Fake current: capacitive offset that flips with sweep direction, plus
@@ -489,13 +520,14 @@ class MockLivePotentiostat:
         return applied, measured_V, current_uA
 
     def perform_CV(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None,
-                   last_V=None, scan_direction='Negative'):
+                   last_V=None, scan_direction='Negative', quiet_s=DEFAULT_QUIET_S,
+                   current_range=None):
         """Generate and stream a synthetic cyclic voltammogram.
 
         Builds the same triangular potential sweep the real driver would, then
         fakes a current response: a capacitive baseline plus an oxidation peak
         on the forward sweep and a reduction peak on the reverse, so the trace
-        has the familiar "duck" shape.
+        has the familiar "duck" shape. The quiet time is not waited out.
         """
         applied, measured_V, current_uA = self._synth_cv(
             min_V, max_V, cycles, mV_s, step_hz, start_V, last_V, scan_direction)
@@ -503,12 +535,11 @@ class MockLivePotentiostat:
 
         self._stream(measured_V, current_uA)
 
-        duration_s = n / step_hz
-        time_stamps = np.linspace(0, duration_s, n)
-        cycle_points = max(1, n // max(cycles, 1))
-        cycle_nums = np.zeros(n)
-        for c in range(cycles):
-            cycle_nums[c * cycle_points:(c + 1) * cycle_points] = c
+        if current_range is not None:
+            self.set_current_range(current_range)
+        time_stamps = self._report_batch(n, max(1, int(np.round(1000 / step_hz))),
+                                         current_uA)
+        cycle_nums = cv_cycle_numbers(applied, min_V, max_V, cycles)
         return np.column_stack(
             (time_stamps, measured_V, current_uA, cycle_nums, np.zeros(n), applied)
         )
@@ -579,19 +610,14 @@ class MockLivePotentiostat:
 
         duration_s = points_done / step_hz
         time_stamps = np.linspace(0, duration_s, points_done)
-        cycle_points = max(1, n // max(cycles, 1))
-        cycle_nums = np.zeros(points_done)
-        for c in range(cycles):
-            start = c * cycle_points
-            if start >= points_done:
-                break
-            cycle_nums[start:min((c + 1) * cycle_points, points_done)] = c
+        cycle_nums = cv_cycle_numbers(applied, min_V, max_V, cycles)
         return np.column_stack(
             (time_stamps, measured_V, current_uA, cycle_nums,
              np.zeros(points_done), applied)
         )
 
-    def perform_DPV(self, waveform, start_V, sample_hz):
+    def perform_DPV(self, waveform, start_V=None, sample_hz=250,
+                    quiet_s=DEFAULT_QUIET_S, current_range=None, range_period=1):
         """Stream a synthetic DPV response for a pre-built target waveform.
 
         Mirrors the slim real ``perform_DPV``: the staircase-plus-pulse shape is
@@ -604,7 +630,7 @@ class MockLivePotentiostat:
         applied = np.asarray(waveform, dtype=float)
         n = len(applied)
         if n == 0:
-            return np.zeros((0, 2))
+            return np.zeros((0, 4))
 
         # Centre the fake redox wave in the middle of the scanned window so a
         # peak lands wherever the sweep passes through it.
@@ -617,5 +643,9 @@ class MockLivePotentiostat:
 
         self._stream(measured_V, current_uA)
 
-        # Real perform_DPV returns raw [current(A), potential]; match that shape.
-        return np.column_stack((current_uA * 1e-6, measured_V))
+        # Same columns as the real perform_DPV: time, potential, current, target
+        step_ms = int(np.round(np.ceil(1000 / sample_hz)))
+        if current_range is not None:
+            self.set_current_range(current_range)
+        return np.column_stack((self._report_batch(n, step_ms, current_uA), measured_V,
+                                current_uA, applied))

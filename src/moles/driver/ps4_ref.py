@@ -6,7 +6,7 @@ open-source potentiostat platform described in Device 2025, 3, 100567
 (doi: 10.1016/j.device.2024.100567). Licensed under the Apache License,
 Version 2.0.
 
-This file has been modified for the MOLES project by. The
+This file has been modified for the MOLES project. The
 changes harden the original command set:
   - logging via the standard library in place of print statements
   - SerialReadTimeout / SerialAckError and retry helpers, so a short or
@@ -26,6 +26,7 @@ import threading
 import time
 import numpy as np
 from collections import deque
+from contextlib import contextmanager
 from enum import IntEnum
 from pathlib import Path
 # import tomllib
@@ -33,6 +34,7 @@ import sys
 from typing import Union
 from .proc_echem import *
 from typing import List
+from ..onboarding import firmware as firmware_notes
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,12 @@ class SerialAckError(Exception):
     """Raised when the device does not acknowledge a command with "OK", even
     after the command has been re-sent once. Means the command may not have
     taken effect on the hardware."""
+
+
+class WaveformTrackingError(Exception):
+    """Raised when a batch run's output stops following the programmed
+    waveform, or the firmware rejects a corrupted waveform point. The run has
+    already been stopped and the cell disconnected when this is raised."""
 
 
 class Commands(IntEnum):
@@ -76,6 +84,14 @@ class Commands(IntEnum):
     # ([u32 n_samples][u32 period_us]); requires Aug 2026 firmware. The
     # driver probes for it once and falls back to the serial burst.
     STEP_CAPTURE = 21
+    # The same capture with the step made by the DAC while the cell stays
+    # connected ([u32 n_samples][u32 period_us][u32 n_pre][f32 dac_V]);
+    # requires firmware 1.7 (FW_FEATURE_DAC_STEP).
+    DAC_STEP_CAPTURE = 22
+    # On-board iR compensation for batches started with BATCH_FLAG_IR_COMP:
+    # its configuration, and its run report; firmware 1.8 (FW_FEATURE_IR_COMP).
+    IR_CONFIG = 23
+    IR_REPORT = 24
 
     
 class Resistors():
@@ -117,20 +133,374 @@ HW_VOLTAGE_COMPLIANCE_V = 4.6
 VOLTAGE_WARN_THRESHOLD_V = 4.5
 
 # Firmware step-capture (CMD_STEP_CAPTURE) defaults for the R_u measurement:
-# 25 us sampling (the firmware's floor) over 150 ms. The fast end matters
-# most: small analytical electrodes give R_u*C_dl of only ~20-50 us
-# (bench 2026-08-15), so every microsecond of the first samples counts;
-# the long tail pins down the faradaic baseline.
+# 25 us sampling (the firmware's floor) over 150 ms. Only the first
+# millisecond or so feeds the fit; the rest is kept in the saved traces to
+# show what the cell did afterwards.
 RU_CAPTURE_PERIOD_US = 25
 RU_CAPTURE_MS = 150.0
 
-# The switch-close instrument artifact the control capture measures lives in
-# the first moments of a trace; beyond this window the control is only noise
-# and OCP drift, which subtracting would inject into the step traces.
+# While the switch is open the control amplifier winds up against its rail,
+# so for the first few samples after the switch closes the current is its
+# recovery (~0.5 mA for ~50 us on the bench, 2026-09-27), not the cell's
+# response. Its sign follows the setpoint error, so it flips with the step
+# direction and cannot be subtracted as a fixed shape; those samples are
+# skipped instead. RU_MIN_BLANK_MS skips the first three 25 us samples, which
+# covers the recovery on every trace so far. The zero-step control capture
+# extends it on a board that recovers more slowly: the last sample within
+# RU_ARTIFACT_WINDOW_MS still off the control's settled level by more than
+# RU_ARTIFACT_SIGMAS noise widths and RU_ARTIFACT_FRACTION of its first
+# sample's excursion, plus one sample of margin. (Without the fraction,
+# ~30 uA wiggles after the spike stretched the skip, and the answer moved
+# with it: 346 vs 407 ohm on repeats, bench 2026-08-15.) A recovery longer
+# than RU_MAX_BLANK_MS would hide the transient the fit needs, so it is
+# refused.
 RU_ARTIFACT_WINDOW_MS = 2.0
+RU_ARTIFACT_SIGMAS = 6.0
+RU_ARTIFACT_FRACTION = 0.1
+RU_MIN_BLANK_MS = 0.075
+RU_MAX_BLANK_MS = 0.5
+
+# The fit covers this long after the skipped samples (at least
+# RU_FIT_MIN_SAMPLES samples, for the slow serial fallback). A real cell
+# decays on several time scales, and a longer window lets the slower ones
+# drag the extrapolated current down and R_u up: on a ferrocene cell 1, 2
+# and 5 ms windows gave 368-389, 384-397 and 411-429 ohm (bench 2026-09-27).
+RU_FIT_WINDOW_MS = 1.0
+RU_FIT_MIN_SAMPLES = 8
+
+# Ohmic current is symmetric in the step direction. When one step's early
+# current (relative to the zero-step control) exceeds the other's by more than
+# this factor, something besides R_u dominates, e.g. a step that landed on a
+# redox wave, and the measurement is refused. The ferrocene cell above read
+# ~1.6, from ferrocene oxidizing on the positive step.
+RU_MAX_ASYMMETRY = 3.0
+
+# Firmware 1.7's DAC-step capture moves the potential with the cell already
+# connected, so there is no recovery to skip and no charge pushed into the
+# double layer before the fit starts (the switch-close spike did both, and
+# read R_u high: 335-384 ohm on a ferrocene cell whose CVs put it at
+# ~225-320, bench 2026-09-27). What the board reads is then the cell's own
+# current through the board's filters, fixed by the as-built parts (PCBWay
+# BOM, 2026-05-02): the potential translator (R6 300k x C14 56 pF, 16.8 us),
+# the current-to-voltage converter on range 0 (93.4 ohm x ~16.8 nF, 1.6 us)
+# and the WE_OUT translator (R21 100k x C24 150 pF, 15 us). Each reading
+# also sums 16 ADC conversions spread over ~9.4 us. The fit models all of
+# this. On a 0.3 ms cell, a plain exponential fitted from 30 us reads R_u
+# 16 % high (the rise drags it), and one fitted from 100 us, past the rise,
+# reads it 10 % low (the filters delay the whole decay). The fit starts
+# RU_DAC_FIT_START_MS after the step, past the steepest part of the rise, and
+# RU_PRE_SAMPLES readings before the step give the cell's zero.
+RU_FILTER_TAUS_MS = (0.0168, 0.0016, 0.0150)
+RU_ADC_WINDOW_MS = 0.0094
+RU_DAC_FIT_START_MS = 0.03
+RU_PRE_SAMPLES = 40
+
+# A DAC-step fit whose current at t=0 is uncertain by more than this fraction
+# (its own standard error) is refused: the step current is too small against
+# the noise, as for a 50 mV step on a ~10 kohm cell, which on range 0 draws
+# only about the ~4 uA noise of a single reading.
+RU_MAX_I0_ERROR = 0.05
 
 # The firmware's KADC16: raw 16-bit ADC counts to ADC volts (3.3 V full scale)
 ADC16_COUNTS_TO_V = 3.3 / 65535.0
+
+# Waveform bytes per upload message. USB full-speed packets carry at most 64
+# bytes, and a message that fits in one packet always reaches the firmware
+# whole; a longer one arrives in pieces, and a piece boundary is exactly where
+# older firmware's frame-silence race cut 66-byte CV/DPV uploads short,
+# shifting every later waveform point 2 bytes off its float boundary and
+# swinging the output rail to rail until the ring wrapped (bench-diagnosed
+# 2026-09-23). 48 leaves room for the 6-byte positional header and is a whole
+# number of 6-point (24-byte) feed chunks.
+WAVEFORM_MSG_DATA_BYTES = 48
+
+# Read timeout while a batch streams. Samples arrive every few milliseconds, so
+# a silence this long means the stream has stopped (for example the firmware
+# ended it on a corrupted setpoint), and the run should fail fast instead of
+# waiting out the port's 10 s default with the plot frozen.
+BATCH_READ_TIMEOUT_S = 3.0
+
+# Per-batch options (the optional third EXECUTE word, late September 2026
+# firmware; older firmware ignores it, and two-word hosts get neither option).
+# SAMPLE_AT_END reads the cell at the end of each setpoint's dwell, as
+# staircase and pulse voltammetry expect, instead of ~0.1 ms after the setpoint
+# is written, where every 2.4 mV DAC step's charging spike lands in the reading
+# (bench 2026-09-23: +/-3.3 uA on a ferrocene CV). STARVE_FAILSAFE makes the
+# firmware end the batch with the cell disconnected if waveform data stops
+# arriving for 2 s. Only CV/DPV ask for it: the alternating-polarity loop
+# restarts a failed stream without reconnecting the cell.
+BATCH_FLAG_SAMPLE_AT_END = 1 << 0
+BATCH_FLAG_STARVE_FAILSAFE = 1 << 1
+# AUTO_RANGE lets the firmware change the current range during the batch as
+# the current changes (firmware 1.5+). It only changes range as a step begins,
+# so each reading at the end of a step is on the range it settled on, and only
+# at points that are a multiple of the period in the flag word's top 16 bits:
+# a DPV passes its step-plus-pulse length, so both readings of a pulse pair
+# share a range.
+BATCH_FLAG_AUTO_RANGE = 1 << 2
+BATCH_RANGE_PERIOD_SHIFT = 16
+# Add the ohmic drop back onto each setpoint on the board, as configured by
+# Commands.IR_CONFIG (firmware 1.8+; see configure_ir_compensation)
+BATCH_FLAG_IR_COMP = 1 << 3
+
+# Capability flags in the firmware's diagnostics report (September 2026+)
+FW_FEATURE_SAMPLE_AT_END = 1 << 0
+FW_FEATURE_ABSOLUTE_TIMING = 1 << 1
+FW_FEATURE_STARVE_FAILSAFE = 1 << 2
+# Current ranges 1-4 connect one feedback resistor each (firmware 1.4+); older
+# firmware's switch table connected the wrong combinations on these boards
+FW_FEATURE_TRUE_RANGES = 1 << 3
+# The batch auto-range option above (firmware 1.5+)
+FW_FEATURE_AUTO_RANGE = 1 << 4
+# Commands.DAC_STEP_CAPTURE, the R_u step made with the cell connected
+# (firmware 1.7+)
+FW_FEATURE_DAC_STEP = 1 << 5
+# On-board iR compensation (firmware 1.8+)
+FW_FEATURE_IR_COMP = 1 << 6
+
+# Limits of the on-board iR loop. The correction moves at most IR_MAX_STEP_V
+# per step (2.5 V/s at 4 ms steps; the ferrocene CVs of 2026-09-27 needed
+# under 1 mV per step), and never further than the output can go: the
+# compliance limit less the sweep's largest programmed potential, so the
+# window of a scan is never what limits it. The board ends the run with the
+# cell disconnected on:
+#  - a runaway, the signature of an overestimated R_u: the correction climbs
+#    at its walking limit and still falls further behind the readings, for
+#    IR_RUNAWAY_MS. That bounds how far past the program it can drive the
+#    cell to about 25 steps' worth, ~0.25 V. (Catching up with a large but
+#    steady drop also walks at the limit, but gains every step.)
+#  - the correction held at that cap, or the output at the DAC's end, for
+#    IR_LIMIT_MS: the board cannot deliver the compensated sweep.
+# Each new reading moves the smoothed correction IR_FEEDBACK_ALPHA of the
+# way, which halves the reading noise fed back at one step's lag.
+IR_MAX_STEP_V = 0.010
+IR_RUNAWAY_MS = 100.0
+IR_LIMIT_MS = 250.0
+IR_MIN_HEADROOM_V = 0.05
+IR_FEEDBACK_ALPHA = 0.5
+# Largest share of R_u the live correction may add back. The board's loop is
+# one step behind, so it stays stable up to the TRUE R_u; this keeps a margin
+# for R_u measured ~5 % high.
+IR_MAX_FRACTION = 0.9
+
+# Current ranges (gain index 0-4) on firmware 1.4+: nominal feedback
+# resistance in ohms, bench-confirmed on board TEST within 1 % (2026-09-27).
+# Range 0 is three resistors together and is the range every board's current
+# calibration was made on; ranges 1-3 are 1k, 10k and 100k, each with the 1M
+# base in parallel, and range 4 is the 1M base alone. Each switched resistor
+# carries ~4 ohm of switch resistance.
+RANGE_OHMS = (93.4, 1003.0, 9905.0, 90912.0, 1.0e6)
+RANGE_LABELS = ('+/-50 mA', '+/-5 mA', '+/-500 uA', '+/-50 uA', '+/-5 uA')
+# The amplifier output swings about +/-4.9 V before a range's reading clips.
+# A reading beyond AMP_SATURATION_V sits at its range's limit: the current was
+# larger than the range can read, and while it was, the cell was not held at
+# the programmed potential.
+AMP_FULL_SCALE_V = 4.9
+AMP_SATURATION_V = 4.75
+# An auto-ranged run starts on the least sensitive range and the firmware
+# moves one range more sensitive per this many points at most, so the run is
+# held at its first potential long enough to climb all the way before its
+# saved data begins. Those lead-in points are read but not kept: on the least
+# sensitive ranges a small current is noisy and carries the zero correction's
+# residual error (bench 2026-09-27: a few uA jump over the first 16 points).
+AUTO_RANGE_UP_POINTS = 8
+
+# The diagnostics report's counters, in order. Older firmware sends a prefix
+# of this list: four counters before September 2026, then five.
+DIAGNOSTIC_FIELDS = ('reset_flags', 'tx_dropped', 'rx_overflow', 'starved_steps',
+                     'rejected_setpoints', 'late_steps', 'max_late_ms',
+                     'resyncs', 'starve_aborts', 'features')
+
+# Time the cell is held, connected, at a scan's first potential before the
+# waveform starts: the conventional "quiet time", which lets the double layer
+# charge so the first points are not a switch-on transient.
+DEFAULT_QUIET_S = 2.0
+
+# The CE DAC is 12-bit: the output takes one of 4096 levels across the +/-5 V
+# span, about 2.42 mV apart at the cell.
+DAC_FULL_SCALE_CODES = 4095
+# That spacing for a board without a stored voltage calibration: the 10 V span
+# times the legacy x0.9919 scale inside _scale_input_voltages, over the codes.
+# A board's own spacing (dac_grid) differs by its calibration slope, ~1 %.
+NOMINAL_DAC_STEP_V = 10.0 * 0.9919 / DAC_FULL_SCALE_CODES
+
+# A run's true step period is measured from when its data arrive. It replaces
+# the nominal period on the time axis only when the run is long enough for the
+# measurement to beat the device clock's own ~0.2 % error, and it is plausible.
+TIMING_FIT_MIN_S = 10.0
+TIMING_FIT_MAX_DEVIATION = 0.01
+TIMING_FIT_MAX_RESIDUAL_S = 0.05
+
+
+class WaveformTracker:
+    """Spots a batch output that has stopped following its programmed waveform.
+
+    Between consecutive samples of a healthy run the measured potential moves
+    by the programmed step (millivolts for a sweep, one pulse edge for DPV),
+    or by less when the cell cannot slew that fast, and it stays close to the
+    programmed potential. Corrupted setpoints, such as a waveform ring read
+    off its float boundaries, throw the output volts away in one sample, in a
+    direction the program never asked for, and it then sits at a rail or
+    keeps jumping. A sample counts as a jump when the measured change is
+    large AND disagrees with the programmed change by as much: a lagging cell
+    fails the first test, a cell following a big programmed step the second,
+    and output that drifts out of compliance never jumps at all.
+
+    The run stops when, after a jump, the output stays away from where it was
+    tracking for ``HOLD_SAMPLES`` samples, or when ``TRIP_JUMPS`` jumps land
+    within ``WINDOW`` samples. A one-sample glitch jumps out and straight
+    back, and passes.
+    """
+    JUMP_V = 0.5
+    HOLD_SAMPLES = 3
+    TRIP_JUMPS = 3
+    WINDOW = 12
+
+    def __init__(self, programmed_V):
+        self._programmed = np.asarray(programmed_V, dtype=float)
+        self._prev_index = None
+        self._prev_measured = None
+        self._prev_offset = 0.0
+        self._jumps = deque()
+        self._away_since = None     # (index, offset tracked before the jump)
+        self._away_count = 0
+
+    def update(self, first_index, measured_V):
+        """Check measured potentials for points ``first_index`` onwards.
+
+        Both arrays are in the driver's raw potential units (before the
+        board's read calibration). Returns a description of the fault once
+        the guard trips, otherwise None.
+        """
+        for k, measured in enumerate(np.asarray(measured_V, dtype=float)):
+            i = first_index + k
+            if i >= len(self._programmed) or not np.isfinite(measured):
+                continue
+            offset = measured - self._programmed[i]
+            if self._prev_index == i - 1:
+                moved = measured - self._prev_measured
+                asked = self._programmed[i] - self._programmed[i - 1]
+                if abs(moved) > self.JUMP_V and abs(moved - asked) > self.JUMP_V:
+                    self._jumps.append((i, moved))
+                    if self._away_since is None:
+                        self._away_since = (i, self._prev_offset)
+                        self._away_count = 0
+            if self._away_since is not None:
+                if abs(offset - self._away_since[1]) > self.JUMP_V:
+                    self._away_count += 1
+                    if self._away_count >= self.HOLD_SAMPLES:
+                        return (f"the measured potential jumped "
+                                f"{offset - self._away_since[1]:+.2f} V away "
+                                f"from the programmed waveform at point "
+                                f"{self._away_since[0]} and did not come back")
+                else:
+                    self._away_since = None    # back on track: a glitch
+            self._prev_index, self._prev_measured = i, measured
+            self._prev_offset = offset
+            while self._jumps and self._jumps[0][0] <= i - self.WINDOW:
+                self._jumps.popleft()
+            if len(self._jumps) >= self.TRIP_JUMPS:
+                worst = max(abs(m) for _, m in self._jumps)
+                return (f"the measured potential jumped by up to {worst:.2f} V "
+                        f"between samples {len(self._jumps)} times within "
+                        f"{self.WINDOW} samples, near point {i}")
+        return None
+
+
+def cv_cycle_numbers(waveform, min_V, max_V, cycles):
+    """Label each point of a CV target waveform with its cycle (0-based).
+
+    Cycles are counted by how far the scan has swept since it began: every
+    full round trip across the window (2 x |max_V - min_V| of travel) is one
+    cycle. This follows the real sweep wherever Start sits, where splitting
+    the points evenly drifts whenever a lead-in or lead-out is present. The
+    lead-out to the final potential stays with the last cycle, and the point
+    that closes a round trip stays with the cycle it closes.
+    """
+    waveform = np.asarray(waveform, dtype=float)
+    n_cycles = max(int(cycles), 1)
+    period = 2.0 * abs(max_V - min_V)
+    if waveform.size == 0 or period == 0:
+        return np.zeros(waveform.size)
+    travel = np.concatenate(([0.0], np.cumsum(np.abs(np.diff(waveform)))))
+    # The small tolerance absorbs float round-off in the running sum, so a
+    # point landing exactly on the end of a round trip is not bumped forward
+    labels = np.ceil(travel / period - 1e-6) - 1
+    return np.clip(labels, 0, n_cycles - 1)
+
+
+def build_cv_waveform(min_V, max_V, cycles, step_V, start_V, last_V,
+                      scan_direction='Negative'):
+    """The sequence of target potentials for a CV sweep.
+
+    A 'Negative' scan starts by going down to min_V; a 'Positive' scan starts
+    by going up to max_V. One cycle visits each vertex once: Start -> first
+    vertex -> second vertex, the vertex-to-vertex sweeps repeat for the
+    remaining cycles, then the scan leaves the second vertex for Last.
+
+    Every leg moves in equal steps as close to ``step_V`` as its length allows
+    and lands exactly on its end vertex, and each vertex appears once, so the
+    sweep neither pauses at a turn nor runs fast on a leg (the old legs were
+    ``linspace`` with one point too few, and repeated every vertex).
+    """
+    if scan_direction == 'Positive':
+        first, second = max_V, min_V
+    else:
+        first, second = min_V, max_V
+
+    # Each cycle sweeps first -> second; the return to the first vertex only
+    # runs between cycles, so the lead-out to Last cannot add a cycle
+    vertices = [start_V, first, second]
+    for _ in range(max(1, int(cycles)) - 1):
+        vertices += [first, second]
+    vertices.append(last_V)
+
+    cv = [float(start_V)]
+    for v_from, v_to in zip(vertices[:-1], vertices[1:]):
+        span = abs(v_to - v_from)
+        if span == 0:
+            continue
+        n_steps = max(1, int(np.round(span / step_V)))
+        cv.extend(np.linspace(v_from, v_to, n_steps + 1)[1:])
+    return np.asarray(cv, dtype=float)
+
+
+def measure_step_period_ms(chunk_times_s, points_per_chunk, nominal_ms):
+    """Measure a batch's real step period from when its chunks arrived.
+
+    The device clocks points on its own oscillator, which runs ~0.2 % fast
+    (bench 2026-09-23), and the host blocks on every chunk, so the arrival
+    times follow the device clock plus a little USB and scheduling jitter; a
+    straight-line fit through all of them averages the jitter out.
+
+    Returns:
+        tuple: ``(period_ms, trusted)``. ``trusted`` is False when the run was
+            too short, the arrivals too irregular (the host fell behind), or
+            the result implausible; the nominal period should be used then.
+    """
+    t = np.asarray(chunk_times_s, dtype=float)
+    # The first arrivals include the stream's start-up latency
+    t = t[min(5, len(t) // 10):]
+    if len(t) < 10:
+        return None, False
+    k = np.arange(len(t))
+    slope, intercept = np.polyfit(k, t, 1)
+    period_ms = float(slope / points_per_chunk * 1000.0)
+    scatter_s = float(np.std(t - (slope * k + intercept)))
+    trusted = ((t[-1] - t[0]) >= TIMING_FIT_MIN_S
+               and abs(period_ms / nominal_ms - 1.0) <= TIMING_FIT_MAX_DEVIATION
+               and scatter_s <= TIMING_FIT_MAX_RESIDUAL_S)
+    return period_ms, bool(trusted)
+
+
+def _format_ms(value_ms):
+    """A duration for a message: microseconds below 1 ms, where one decimal
+    of milliseconds would print a 25 us sample interval as '0.0 ms'."""
+    if value_ms is None or not np.isfinite(value_ms):
+        return str(value_ms)
+    if abs(value_ms) < 1.0:
+        return f"{value_ms * 1000.0:.0f} \u00b5s"
+    return f"{value_ms:.1f} ms"
 
 
 class Potentiostat():
@@ -148,14 +518,36 @@ class Potentiostat():
     # Whether the connected firmware has CMD_STEP_CAPTURE: None until the
     # first R_u measurement probes for it, then cached for the connection.
     _step_capture_supported = None
+    # Whether the connected firmware has CMD_BUFFER_WRITE_AT: None until the
+    # first CV/DPV upload probes for it, then cached for the connection.
+    _positional_writes_supported = None
+    # Whether the connected firmware answers the diagnostics query: None until
+    # the first batch run asks, then cached for the connection.
+    _diagnostics_supported = None
+    # What the last CV/DPV batch run reported about itself: sampling mode,
+    # nominal and measured step period, and the firmware's health counters
+    # for the run (see _finish_batch_report). None before the first run.
+    last_batch_report = None
 
+    # Resistance the driver converts each range's readings with. Range 0
+    # keeps the historical 100 ohm that every board's read calibration was
+    # fitted against (the range is really ~93.4 ohm; the calibration slope
+    # carries the difference); ranges 1-4 are the real ones of firmware 1.4+.
     res_vals    = {Resistors.R_100: 1e2,
-                Resistors.R_1K: 1e3,
-                Resistors.R_10K: 1e4,
-                Resistors.R_100K: 1e5,
-                Resistors.R_1M: 1e6,
-                #R_10M: 1e7,
+                Resistors.R_1K: RANGE_OHMS[1],
+                Resistors.R_10K: RANGE_OHMS[2],
+                Resistors.R_100K: RANGE_OHMS[3],
+                Resistors.R_1M: RANGE_OHMS[4],
     }
+    # Per-board feedback resistances, for calibration code to replace with
+    # measured values; only their ratios to range 0 are used
+    range_ohms = RANGE_OHMS
+    # The connected firmware's capability flags: None until first asked for
+    _features = None
+    # The connected firmware's release (e.g. "1.8"): None until known
+    firmware_version = None
+    # Which current range each sample of the last batch was taken on
+    last_batch_ranges = None
     
     def _select_resistor(self, current):
         """_summary_
@@ -229,6 +621,11 @@ class Potentiostat():
             except Exception:
                 pass
             logger.info("[PS %s] serial dev created on %s", self.device_ID, self.serial_port)
+            # The board may have been reflashed since a previous connection
+            self._positional_writes_supported = None
+            self._diagnostics_supported = None
+            self._features = None
+            self.firmware_version = None
             try:
                 # A session that died mid-experiment can leave the device still
                 # streaming batch data, which would garble the handshake below.
@@ -253,6 +650,21 @@ class Potentiostat():
                 self.serial.close()
                 self.serial = None
                 raise
+            self._note_firmware()
+
+    def _note_firmware(self):
+        """Learn which firmware release the board runs and note it where the
+        launcher can show it. Never fails the connection."""
+        report = self._read_diagnostics_quietly()
+        if report is None and self._diagnostics_supported is not False:
+            return
+        self._features = int(report.get('features', 0)) if report else 0
+        self.firmware_version = firmware_notes.version_from_diagnostics(report)
+        if self.firmware_version is None:
+            return
+        logger.info("[PS %s] firmware %s", self.device_ID, self.firmware_version)
+        firmware_notes.record(firmware_notes.usb_serial_for_port(self.serial_port),
+                              self.firmware_version)
 
     def disconnect(self):
         with self._port_lock:
@@ -393,26 +805,26 @@ class Potentiostat():
         self._write_cmd(Commands._RESET_BUFFER,np.uint32(pos))
 
     def _write_to_buffer(self, data):
-        # Override to force small chunks for flow control
-        # Original logic used _chunk_size (254) which might be too large for rapid bursts
-        
-        SAFE_CHUNK_SIZE = 64 # Bytes. Safe for hardware RX FIFO (usually 64 or 128 bytes)
+        """Append waveform bytes to the device ring with the legacy write
+        (CMD_BUFFER_WRITE), in messages that each fit one USB packet."""
+        # Small, paced messages: every message must stay inside one USB packet
+        # (see WAVEFORM_MSG_DATA_BYTES), and the gap keeps each in its own frame
         tx_delay = 0.01 # 10ms delay to allow hardware interrupt usage
-        
+
         ind = 0
         total_len = len(data)
-        
+
         while ind < total_len:
-            end = min(ind + SAFE_CHUNK_SIZE, total_len)
+            end = min(ind + WAVEFORM_MSG_DATA_BYTES, total_len)
             chunk = data[ind:end]
-            
+
             # Write chunk
             self._write_cmd(Commands._WRITE_BUFFER, chunk, False)
             self.serial.flush() # Force OS to send
             time.sleep(tx_delay) # Wait for hardware to ingest
-            
-            ind += SAFE_CHUNK_SIZE
-            
+
+            ind += WAVEFORM_MSG_DATA_BYTES
+
         return True
 
     def _read_from_buffer(self, data_len):
@@ -426,7 +838,513 @@ class Potentiostat():
                 f"Batch stream returned {len(result)} of {data_len} bytes"
             )
         return result
-                    
+
+    def _read_dac_setpoint(self):
+        """The CE DAC setpoint exactly as the firmware holds it (raw float32,
+        ADC-scale volts)."""
+        with self._port_lock:
+            self._write_cmd(Commands.READ_DAC, np.uint8([DAC.CE_IN]), False)
+            raw = self._read_with_retry(4, Commands.READ_DAC, np.uint8([DAC.CE_IN]))
+        return np.frombuffer(raw, np.float32)[0]
+
+    def _probe_positional_writes(self):
+        """Find out whether the firmware has CMD_BUFFER_WRITE_AT (July 2026+).
+
+        Older firmware silently ignores the command, so a positional upload
+        to such a board would leave the ring holding whatever an earlier run
+        left there; the answer has to be known before the upload is trusted.
+        The probe fills ring slot 0 twice, first with a legacy write and then
+        with a positional write of the neighbouring float, runs a one-step
+        batch, and reads the DAC setpoint back: it shows which write the
+        stepper saw. Both values equal the setpoint already applied to within
+        one float step, far below one DAC count, so the output never moves
+        and the probe is safe with the cell connected.
+        """
+        with self._port_lock:
+            legacy_val = np.float32(self._read_dac_setpoint())
+            toward = np.float32(0.0) if legacy_val > 1.0 else np.float32(3.3)
+            positional_val = np.nextafter(legacy_val, toward)
+            rx_len = 9 if self._auto_gain else 8
+
+            self._reset_buffer(0)
+            self._write_cmd(Commands._WRITE_BUFFER, legacy_val.tobytes(), False)
+            self.serial.flush()
+            time.sleep(0.01)
+            header = np.uint16([4, 0]).tobytes()
+            self._write_cmd(Commands._WRITE_BUFFER_AT,
+                            header + positional_val.tobytes(), False)
+            self.serial.flush()
+            time.sleep(0.01)
+            self._write_cmd(Commands.EXECUTE_VOLTAGE_BATCH, np.uint32([1, 1]),
+                            True, retry=False)
+            if len(self.serial.read(rx_len)) < rx_len:
+                self.halt_batch_stream()
+                raise SerialReadTimeout("No sample from the one-step firmware probe")
+            seen = np.float32(self._read_dac_setpoint())
+
+        supported = bool(seen == positional_val)
+        if not supported and seen != legacy_val:
+            logger.warning("[PS %s] Upload probe read back an unexpected setpoint "
+                           "(%r); using legacy uploads.", self.device_ID, seen)
+        self._positional_writes_supported = supported
+        logger.info("[PS %s] Waveform uploads: %s", self.device_ID,
+                    "positional (CMD_BUFFER_WRITE_AT)" if supported
+                    else "legacy append (firmware predates CMD_BUFFER_WRITE_AT)")
+        return supported
+
+    def _start_waveform_upload(self, prefill):
+        """Clear the device's waveform ring and load a batch's pre-fill.
+
+        Returns the ring position where the next waveform bytes belong, for
+        ``_write_waveform``.
+        """
+        if self._positional_writes_supported is None:
+            self._probe_positional_writes()
+        self._reset_buffer(0)
+        return self._write_waveform(prefill, 0)
+
+    def _write_waveform(self, data, ring_pos):
+        """Write waveform bytes into the device ring starting at ``ring_pos``.
+
+        Each message fits one USB packet, so the firmware never receives part
+        of one. On firmware with CMD_BUFFER_WRITE_AT every message also names
+        its ring position: a lost or merged message can then never move later
+        points off their float boundaries (merges are what railed the
+        alternating-polarity output in July 2026). Older firmware gets the
+        legacy append. Returns the ring position after the data.
+        """
+        if not self._positional_writes_supported:
+            self._write_to_buffer(data)
+            return (ring_pos + len(data)) % self._rx_buffer_size
+        ind = 0
+        while ind < len(data):
+            # A message may not run past the ring's end; the firmware refuses it
+            n = min(WAVEFORM_MSG_DATA_BYTES, len(data) - ind,
+                    self._rx_buffer_size - ring_pos)
+            header = np.uint16([n, ring_pos]).tobytes()
+            self._write_cmd(Commands._WRITE_BUFFER_AT,
+                            header + bytes(data[ind:ind + n]), False)
+            self.serial.flush()
+            time.sleep(0.01)  # keep each message in its own frame
+            ind += n
+            ring_pos = (ring_pos + n) % self._rx_buffer_size
+        return ring_pos
+
+    @contextmanager
+    def _batch_read_timeout(self, delay_ms):
+        """Use a short read timeout while a batch streams (see
+        BATCH_READ_TIMEOUT_S), scaled up for slow sample rates."""
+        old_timeout = self.serial.timeout
+        chunk_s = 6 * max(1.0, float(delay_ms)) / 1000.0
+        self.serial.timeout = max(BATCH_READ_TIMEOUT_S, 10 * chunk_s)
+        try:
+            yield
+        finally:
+            self.serial.timeout = old_timeout
+
+    def _read_batch_chunk(self, data_len):
+        """Read one chunk of a running batch, explaining a stopped stream."""
+        try:
+            return self._read_from_buffer(data_len)
+        except SerialReadTimeout as exc:
+            self._explain_stream_stop(exc)
+
+    def _explain_stream_stop(self, exc):
+        """Handle a batch stream that stopped delivering samples.
+
+        Raises WaveformTrackingError when the firmware ended the batch itself
+        (it has already disconnected the cell): because its iR compensation
+        ran away, because it caught a corrupted waveform point, or because
+        waveform data stopped arriving for longer than its starvation limit.
+        Otherwise re-raises ``exc``.
+        """
+        report = {}
+        ir = {}
+        try:
+            self.halt_batch_stream()
+            report = self.read_diagnostics()
+            if report.get('features', 0) & FW_FEATURE_IR_COMP:
+                ir = self.read_ir_report()
+        except Exception:
+            logger.warning("[PS %s] Could not read diagnostics after the stream "
+                           "stopped", self.device_ID, exc_info=True)
+        if ir.get('runaway_aborts', 0):
+            self._switch_state = False
+            raise WaveformTrackingError(
+                "The iR compensation ran away (each increase of its "
+                "correction raised the current by more), so the potentiostat "
+                "stopped the run and disconnected the cell. R_u, or the share "
+                "of it compensated, is too high: re-measure R_u or lower the "
+                "percentage. The data up to that point is valid.") from exc
+        if ir.get('limit_aborts', 0):
+            self._switch_state = False
+            raise WaveformTrackingError(
+                "The iR-compensated potential would have gone beyond what the "
+                "potentiostat can output, so it stopped the run and "
+                "disconnected the cell: the ohmic drop there is larger than "
+                "the room left beyond the sweep. Lower the compensation "
+                "percentage or narrow the potential window. The data up to "
+                "that point is valid.") from exc
+        if report.get('rejected_setpoints', 0):
+            self._switch_state = False
+            raise WaveformTrackingError(
+                "The potentiostat refused a corrupted waveform point and "
+                "disconnected the cell to protect it. The data up to that "
+                "point is valid; please repeat the run.") from exc
+        if report.get('starve_aborts', 0):
+            self._switch_state = False
+            raise WaveformTrackingError(
+                "The potentiostat stopped the run and disconnected the cell "
+                "because waveform data stopped arriving from this computer. "
+                "The data up to that point is valid; please repeat the run.") from exc
+        raise exc
+
+    def _abort_waveform_run(self, reason):
+        """Stop a batch whose output has left the programmed waveform,
+        disconnect the cell, and raise WaveformTrackingError."""
+        logger.error("[PS %s] Output left the programmed waveform: %s. "
+                     "Stopping the run and disconnecting the cell.",
+                     self.device_ID, reason)
+        try:
+            # Halt the stepper, then open the switch at once; the pause keeps
+            # the two commands in separate frames, since the firmware runs
+            # only the first legacy command of a frame.
+            self._write_cmd(Commands.EXECUTE_VOLTAGE_BATCH, np.uint32([0, 0]), False)
+            self.serial.flush()
+            time.sleep(0.01)
+            self._write_cmd(Commands.WRITE_SWITCH, np.uint8(SwitchState.Off), False)
+            self.serial.flush()
+            self._switch_state = False
+            time.sleep(0.3)  # let in-flight samples and acknowledgements land
+            self.serial.reset_input_buffer()
+            self.write_switch(SwitchState.Off)  # confirmed this time
+        except Exception:
+            logger.warning("[PS %s] Could not confirm the switch opened after the "
+                           "fault", self.device_ID, exc_info=True)
+        raise WaveformTrackingError(
+            f"The potentiostat's output stopped following the programmed "
+            f"waveform ({reason}). The run was stopped and the cell "
+            f"disconnected to protect it.")
+
+    def _read_diagnostics_quietly(self):
+        """The diagnostics report, or None when it cannot be had.
+
+        Bookkeeping around a run must never cost the run: a short timeout
+        keeps a board whose firmware predates the diagnostics query (July
+        2026) from stalling the start, and that answer is cached for the
+        connection.
+        """
+        if self._diagnostics_supported is False:
+            return None
+        old_timeout = self.serial.timeout
+        try:
+            self.serial.timeout = 0.5
+            report = self.read_diagnostics()
+            self._diagnostics_supported = True
+            return report
+        except SerialReadTimeout:
+            self._diagnostics_supported = False
+            logger.info("[PS %s] Firmware has no diagnostics query; runs will "
+                        "not report device health.", self.device_ID)
+            return None
+        except Exception:
+            logger.warning("[PS %s] Diagnostics read failed", self.device_ID,
+                           exc_info=True)
+            return None
+        finally:
+            self.serial.timeout = old_timeout
+
+    def _begin_batch_report(self, delay_ms, auto_range=False, range_period=1,
+                            ir=None):
+        """Open the run report for a batch, before its upload: snapshot the
+        firmware's cumulative counters and learn which batch options (end-of-
+        step sampling, starvation fail-safe, auto-ranging) it offers.
+
+        ``auto_range`` asks for auto-ranging, changing range only at points
+        that are a multiple of ``range_period``; it is honoured only when the
+        firmware can sample at the end of each step and auto-range.
+
+        ``ir``, a dict of ``ohm`` and ``max_correction_V``, asks the board to
+        add that resistance times the current back onto each setpoint
+        (``configure_ir_compensation``). Unlike the other options this one is
+        never quietly dropped: firmware that cannot do it raises RuntimeError
+        before anything is uploaded."""
+        self.last_batch_report = None
+        self.last_batch_ranges = None
+        before = self._read_diagnostics_quietly()
+        features = before.get('features', 0) if before else 0
+        if before is not None:
+            self._features = features
+        sample_at_end = bool(features & FW_FEATURE_SAMPLE_AT_END)
+        ir_ohm = float(ir['ohm']) if ir else 0.0
+        if ir_ohm > 0:
+            if not (sample_at_end and features & FW_FEATURE_IR_COMP):
+                raise RuntimeError("On-board iR compensation needs firmware 1.8 "
+                                   "or later on this board.")
+            self.configure_ir_compensation(ir_ohm, delay_ms, ir['max_correction_V'])
+        return {
+            'ir_ohm': ir_ohm if ir_ohm > 0 else 0.0,
+            'ir_max_correction_V': (float(ir['max_correction_V'])
+                                    if ir_ohm > 0 else 0.0),
+            'step_ms_nominal': float(delay_ms),
+            'sample_at_end': sample_at_end,
+            'starve_failsafe': bool(features & FW_FEATURE_STARVE_FAILSAFE),
+            'auto_range': bool(auto_range and sample_at_end
+                               and features & FW_FEATURE_AUTO_RANGE),
+            'range_period': max(1, min(int(range_period), 0xFFFF)),
+            'diagnostics_before': before,
+            'chunk_times_s': [],
+        }
+
+    def _execute_batch(self, delay, count, report):
+        """Start the uploaded batch with every option the firmware offers:
+        sampling at the end of each step, the starvation fail-safe, and
+        auto-ranging and iR compensation when the run asked for them."""
+        flags = ((BATCH_FLAG_SAMPLE_AT_END if report['sample_at_end'] else 0)
+                 | (BATCH_FLAG_STARVE_FAILSAFE if report['starve_failsafe'] else 0))
+        if report.get('auto_range'):
+            flags |= (BATCH_FLAG_AUTO_RANGE
+                      | report['range_period'] << BATCH_RANGE_PERIOD_SHIFT)
+        if report.get('ir_ohm'):
+            flags |= BATCH_FLAG_IR_COMP
+        words = [delay, count] + ([flags] if flags else [])
+        # retry=False: re-sending EXECUTE while the firmware is already
+        # streaming would corrupt the batch protocol; a failed ack must abort.
+        self._write_cmd(Commands.EXECUTE_VOLTAGE_BATCH, np.uint32(words), True,
+                        retry=False)
+
+    def _finish_batch_report(self, report, n_points, points_per_chunk,
+                             ranges=None, amp_V=None):
+        """Close a completed batch's run report and keep it as
+        ``last_batch_report``.
+
+        ``health`` holds the firmware's per-run counters for this upload
+        (starved, rejected and late steps, re-anchors, starvation aborts) and
+        the growth of its cumulative ones (dropped and discarded messages)
+        since the run began. ``degraded`` lists, in plain words, anything that
+        means the cell may not have followed the programmed waveform exactly;
+        an empty list is a clean run.
+
+        ``ranges`` and ``amp_V`` — each sample's current range and amplifier
+        output — add which ranges the run used, how often it changed range,
+        and how many readings sat at their range's limit; the ranges are
+        kept as ``last_batch_ranges``. A run with on-board iR compensation
+        adds the board's iR report (``read_ir_report``) as ``ir``.
+        """
+        nominal_ms = report['step_ms_nominal']
+        period_ms, trusted = measure_step_period_ms(
+            report['chunk_times_s'], points_per_chunk, nominal_ms)
+        before = report['diagnostics_before']
+        after = self._read_diagnostics_quietly() if before is not None else None
+        health = {}
+        if after is not None:
+            for key in ('starved_steps', 'rejected_setpoints', 'late_steps',
+                        'max_late_ms', 'resyncs', 'starve_aborts'):
+                if key in after:
+                    health[key] = after[key]
+            for key in ('tx_dropped', 'rx_overflow'):
+                health[key] = max(0, after[key] - before.get(key, 0))
+
+        degraded = []
+        if health.get('starved_steps'):
+            degraded.append(f"the potential was held for {health['starved_steps']} "
+                            f"steps while waveform data was late")
+        if health.get('tx_dropped'):
+            degraded.append(f"{health['tx_dropped']} data messages were dropped "
+                            f"because this computer read them too slowly")
+        if health.get('rx_overflow'):
+            degraded.append(f"{health['rx_overflow']} damaged command frames "
+                            f"were discarded")
+        if health.get('resyncs'):
+            degraded.append(f"the step timing was re-anchored "
+                            f"{health['resyncs']} times after long stalls")
+        if health.get('max_late_ms', 0) >= 2 * nominal_ms:
+            degraded.append(f"a step ran up to {health['max_late_ms']} ms late")
+
+        ir = None
+        if report.get('ir_ohm'):
+            try:
+                ir = self.read_ir_report()
+            except Exception:
+                logger.warning("[PS %s] Could not read the iR compensation "
+                               "report", self.device_ID, exc_info=True)
+            if ir is None:
+                degraded.append("the board's iR compensation report could not "
+                                "be read, so whether it compensated is unknown")
+            elif ir['runs'] < 1:
+                degraded.append("the board did not apply the iR compensation: "
+                                "this run was not compensated")
+            else:
+                ir['limit_V'] = report['ir_max_correction_V']
+                if ir['limited_steps']:
+                    degraded.append(f"the iR correction was held at the output's "
+                                    f"limit for {ir['limited_steps']} steps, so "
+                                    f"part of the ohmic drop there was not "
+                                    f"compensated")
+                if ir['slewed_steps']:
+                    degraded.append(f"the current changed faster than the iR "
+                                    f"correction may follow for "
+                                    f"{ir['slewed_steps']} steps, so the "
+                                    f"compensation lagged there")
+
+        ranges_used, range_changes, saturated = [], 0, 0
+        if ranges is not None:
+            ranges = np.asarray(ranges, dtype=int)
+            valid = np.isfinite(np.asarray(amp_V, dtype=float))
+            ranges_used = sorted(int(r) for r in np.unique(ranges[valid]))
+            range_changes = int(np.count_nonzero(np.diff(ranges[valid])))
+            saturated = int(np.count_nonzero(
+                np.abs(np.asarray(amp_V, dtype=float)[valid]) > AMP_SATURATION_V))
+            self.last_batch_ranges = ranges
+        if saturated:
+            degraded.append(f"{saturated} readings were at the limit of their "
+                            f"current range: the current there was larger than "
+                            f"recorded, and the cell was not held at the "
+                            f"programmed potential")
+
+        self.last_batch_report = {
+            'points': int(n_points),
+            'sample_at_end': report['sample_at_end'],
+            'step_ms_nominal': nominal_ms,
+            'step_ms_measured': period_ms,
+            'time_axis': 'measured' if trusted else 'nominal',
+            'auto_range': bool(report.get('auto_range')),
+            'lead_in_points': int(report.get('lead_in', 0)),
+            'ranges_used': ranges_used,
+            'range_changes': range_changes,
+            'saturated_points': saturated,
+            'ir_ohm': float(report.get('ir_ohm', 0.0)),
+            'ir': ir,
+            'health': health,
+            'degraded': degraded,
+        }
+        if degraded:
+            logger.warning("[PS %s] Batch run degraded: %s", self.device_ID,
+                           "; ".join(degraded))
+        return self.last_batch_report
+
+    def _batch_time_axis(self, n_points):
+        """When each sample of the last batch was taken, in seconds from the
+        moment its first setpoint was applied.
+
+        Uses the step period measured over the run when that measurement can
+        be trusted (the device clock runs ~0.2 % fast), else the nominal one.
+        A sample taken at the end of its step belongs one period after that
+        step began.
+        """
+        report = self.last_batch_report or {}
+        period_ms = report.get('step_ms_nominal', 0.0)
+        if report.get('time_axis') == 'measured':
+            period_ms = report['step_ms_measured']
+        offset = 1 if report.get('sample_at_end') else 0
+        return (np.arange(n_points) + offset) * period_ms / 1000.0
+
+    def _quiet_wait(self, seconds, stop_event=None):
+        """Wait out a quiet time, returning early if a stop is requested."""
+        seconds = max(0.0, float(seconds))
+        if stop_event is None:
+            stop_event = getattr(self, 'stop_event', None)
+        if stop_event is not None:
+            stop_event.wait(seconds)
+        else:
+            time.sleep(seconds)
+
+    def _connect_cell_for_batch(self, quiet_s):
+        """Connect the cell once its waveform is loaded and hold it at the
+        parked first potential for the quiet time.
+
+        Closing the switch only now (not before the upload) makes the hold at
+        the first potential exactly ``quiet_s``: it used to be however long
+        the pre-fill upload took, up to ~2.7 s, and unrecorded.
+        """
+        self.write_switch(SwitchState.On)
+        self._quiet_wait(quiet_s)
+
+    def dac_grid(self):
+        """The potentials the CE DAC can actually produce, as ``(spacing,
+        offset)``: level k is ``offset + k * spacing``, in the same calibrated
+        units as ``write_potential_calibrated``. Waveform points between two
+        levels are rounded to the nearer one by the firmware."""
+        slope = self._calib_v_slope
+        # Avoid div by zero on a malformed calibration row
+        if abs(slope) < 1e-6:
+            slope = 1.0
+        lo, hi = self._scale_output_voltages(np.array([0.0, 3.3]))
+        spacing = (hi - lo) * slope / DAC_FULL_SCALE_CODES
+        return float(spacing), float(lo * slope + self._calib_v_intercept)
+
+    def firmware_features(self):
+        """The connected firmware's capability flags (``FW_FEATURE_*``), or 0
+        when it does not report them. Asked once per connection."""
+        if self._features is None:
+            report = self._read_diagnostics_quietly()
+            self._features = int(report.get('features', 0)) if report else 0
+        return self._features
+
+    def set_current_range(self, current_range):
+        """Choose the current range for the next measurement.
+
+        ``current_range`` is ``'auto'`` or a range index 0-4 (``RANGE_OHMS``,
+        ``RANGE_LABELS``). ``'auto'`` starts on the least sensitive range
+        with every reading tagged with its range, and a batch run with
+        ``auto_range`` then moves between ranges as the current changes; on
+        firmware that cannot auto-range it is range 0 for the whole run. A
+        fixed range above 0 needs firmware 1.4 or later, because older
+        firmware's ranges 1-4 are not the ones they claim to be.
+
+        Returns what the run will use: ``'auto'`` or the fixed range index.
+        """
+        features = self.firmware_features()
+        if current_range == 'auto':
+            self._force_gain(Resistors.R_100)
+            auto = bool(features & FW_FEATURE_AUTO_RANGE)
+            self.write_auto_gain(auto)
+            return 'auto' if auto else Resistors.R_100
+        index = int(current_range)
+        if not 0 <= index < len(RANGE_OHMS):
+            raise ValueError(f"No current range {index}; ranges are 0-{len(RANGE_OHMS) - 1}")
+        if index and not features & FW_FEATURE_TRUE_RANGES:
+            raise ValueError(
+                f"This board's firmware predates the corrected current ranges "
+                f"(firmware 1.4), so only the {RANGE_LABELS[0]} range can be "
+                f"used. Flash the image in firmware/prebuilt/ to use "
+                f"{RANGE_LABELS[index]}.")
+        self._force_gain(index)
+        self.write_auto_gain(False)
+        return index
+
+    def _force_gain(self, index):
+        """Set the current range even if the driver believes it is already
+        set: after an auto-ranged run the board may have moved on."""
+        self.Resistor = None
+        self.write_gain(index)
+
+    def _range_index(self):
+        """The current range the driver last set or read (0 before any)."""
+        return getattr(self, 'Resistor', None) or 0
+
+    def _res_table(self):
+        """``res_vals`` as an array indexed by range."""
+        return np.array([self.res_vals[i] for i in range(len(self.res_vals))], dtype=float)
+
+    def _calibrated_mA(self, raw_A, ranges):
+        """Board-calibrated current (mA) from raw readings, each taken on the
+        range given for it.
+
+        The board's read calibration was fitted on range 0, and both of its
+        parts belong to the amplifier, not the range: the slope to the
+        measurement chain's gain, the intercept to a fixed ~57 mV offset at
+        the amplifier output (bench 2026-09-27: the same offset on every
+        range). So a reading on any range is the range-0 calibration applied
+        to its amplifier voltage, scaled by the ratio of the two ranges'
+        resistances. On range 0 this is exactly the historical calibration.
+        """
+        ranges = np.asarray(ranges, dtype=int)
+        amp_V = -np.asarray(raw_A, dtype=float) * self._res_table()[ranges]
+        range0_mA = (-amp_V / self.res_vals[0] * 1000.0 * self._calib_read_slope
+                     + self._calib_read_intercept)
+        return range0_mA * (self.range_ohms[0] / np.asarray(self.range_ohms, dtype=float)[ranges])
+
     def halt_batch_stream(self):
         """Stop any in-progress batch execution and flush its residue.
 
@@ -644,25 +1562,53 @@ class Potentiostat():
                     logger.warning("[PS %s] Could not halt stream on exit",
                                    self.device_ID, exc_info=True)
 
-    def write_voltage_batch(self, voltages: List[float], delay: np.uint32):
+    def write_voltage_batch(self, voltages: List[float], delay: np.uint32,
+                            before_start=None, auto_range=False, range_period=1,
+                            lead_in=0, ir=None):
         """Write a list of set voltage values to pstat's buffer. Then this buffer is executed.
-        Each set V (WE-RE) will be set and immediately the CE-WE current (A) will be read along with RE-WE potential.
-        If auto-gain mode is active, it will automatically return the gain corrected current values.
+        Each set V (WE-RE) is applied for ``delay`` ms and the CE-WE current (A) is read along with
+        the RE-WE potential: at the end of each step on firmware that can (September 2026+), else
+        right after the setpoint is written. If auto-gain mode is active, it will automatically
+        return the gain corrected current values.
 
         Holds the port lock for the whole batch: the stream protocol cannot
         survive another thread's command being interleaved mid-batch.
 
+        Raises WaveformTrackingError, after stopping the batch and
+        disconnecting the cell, if the measured potential stops following the
+        programmed waveform or the firmware rejects a corrupted waveform point.
+
+        A completed run leaves its sampling mode, step period and the
+        firmware's health counters in ``last_batch_report``.
+
         Args:
             voltages (float): list of voltages to set
             delay (np.uint32): delay between setting voltages (and reading the current and potential)
+            before_start (callable, optional): called once the waveform is
+                loaded, just before it starts (e.g. to connect the cell).
+            auto_range (bool): let the firmware change the current range
+                during the run (see ``set_current_range('auto')``).
+            range_period (int): with ``auto_range``, only change range at
+                points that are a multiple of this.
+            lead_in (int): leading points to run but leave out of the result
+                (see ``_auto_range_lead_in``).
+            ir (dict, optional): ``ohm`` and ``max_correction_V``: the board
+                adds that resistance times the current onto each setpoint
+                (``configure_ir_compensation``; firmware 1.8+, else
+                RuntimeError before anything runs).
 
         Returns:
-            list: 2D array with rows as many as voltages | column 0: CE-WE current (A) | column 1: RE-WE V
+            list: 2D array with rows as many as voltages | column 0: CE-WE current (A) | column 1: RE-WE V.
+            The range each row was read on is left in ``last_batch_ranges``.
         """
         with self._port_lock:
-            return self._write_voltage_batch_unlocked(voltages, delay)
+            return self._write_voltage_batch_unlocked(voltages, delay, before_start,
+                                                      auto_range, range_period, lead_in,
+                                                      ir)
 
-    def _write_voltage_batch_unlocked(self, voltages: List[float], delay: np.uint32):
+    def _write_voltage_batch_unlocked(self, voltages: List[float], delay: np.uint32,
+                                      before_start=None, auto_range=False, range_period=1,
+                                      lead_in=0, ir=None):
         v_per_chunk = 6 #number of potentials (V) written to pstat each time
         bytes_per_v = 4 #number of bytes used for each V
         tx_len = v_per_chunk * bytes_per_v #number of bytes to write at a time
@@ -694,8 +1640,8 @@ class Potentiostat():
         first_tx_bytes -= first_tx_bytes % tx_len #keep chunk-aligned
         tx_ind = 0 #index to iterate on v_bytes
 
-        self._reset_buffer(0) #set the rx buffer of pstat to zero
-        self._write_to_buffer(v_bytes[0:first_tx_bytes]) #write the first chunk
+        report = self._begin_batch_report(delay, auto_range, range_period, ir)
+        ring_pos = self._start_waveform_upload(v_bytes[0:first_tx_bytes]) #clear the ring, write the pre-fill
         time.sleep(0.01) #wait for pstat to receive the message (1ms delay is end of msg for USB)
         tx_ind = first_tx_bytes #move the ind accordingly
 
@@ -703,60 +1649,86 @@ class Potentiostat():
             rx_len = 9 #1 float32 current(A) + 1 float32 potential(V) + 1 uint8 resistor index (per target V)
         else:
             rx_len = 8 #1 float32 current(A) + 1 float32 potential(V) (per target V)
-        
+
         temp_adc = np.zeros((v_count,2),np.float32) #array to hold ADC readings
-        temp_res_val = np.zeros((v_count),np.float32) #array to hold resistor multipliers
+        # The range each point was read on: reported per point when readings
+        # carry it, else the range set before the run
+        temp_range = np.full(v_count, self._range_index(), dtype=int)
+        tracker = WaveformTracker(voltages)
 
-        # retry=False: re-sending EXECUTE while the firmware is already streaming
-        # would corrupt the batch protocol; a failed ack must abort instead.
-        self._write_cmd(Commands.EXECUTE_VOLTAGE_BATCH,np.uint32([delay,v_count]),True,retry=False) #start the protocol
-        for i in range(0,v_count,v_per_chunk): #for each target V
-            data = self._read_from_buffer(rx_len * v_per_chunk) #read
-            if (tx_ind + tx_len) <= v_byte_count: #write if the target V list is not exhausted
-                self._write_to_buffer(v_bytes[tx_ind:tx_ind+tx_len])
-                tx_ind += tx_len
+        if before_start is not None:
+            before_start()
+        self._execute_batch(delay, v_count, report) #start the protocol
+        with self._batch_read_timeout(delay):
+            for i in range(0,v_count,v_per_chunk): #for each target V
+                data = self._read_batch_chunk(rx_len * v_per_chunk) #read
+                report['chunk_times_s'].append(time.monotonic())
+                if (tx_ind + tx_len) <= v_byte_count: #write if the target V list is not exhausted
+                    ring_pos = self._write_waveform(v_bytes[tx_ind:tx_ind+tx_len], ring_pos)
+                    tx_ind += tx_len
 
-            temp_ind = 0 #temp index in data
-            for j in range(v_per_chunk):
-                # Read raw ADC values (Current, Potential)
-                adc_vals = np.frombuffer(data, np.float32, 2, temp_ind)
-                temp_adc[i+j,:] = adc_vals 
-                temp_ind += 8
-                
-                # Check for Frame Shift via Potential Range (Approx +/- 15V limit)
-                # Raw float interpretation of wrong bytes often yields huge numbers
-                if np.any(np.abs(adc_vals) > 15.0):
-                     logger.warning("[PS %s] Frame shift detected! Invalid potential/current raw: %s",
-                                    self.device_ID, adc_vals)
-                     temp_adc[i+j,:] = np.nan
-                
-                if self._auto_gain:
-                    temp_gain = np.frombuffer(data, np.uint8, 1, temp_ind)[0]
-                    temp_ind += 1
-                    
-                    # Validate Resistor Index
-                    if temp_gain in self.res_vals:
-                         temp_res_val[i+j] = self.res_vals[temp_gain]
-                    else:
-                         logger.warning("[PS %s] Frame shift detected! Invalid gain index: %s",
-                                        self.device_ID, temp_gain)
-                         temp_res_val[i+j] = np.nan
-                         temp_adc[i+j,:] = np.nan # Invalidate data too
+                temp_ind = 0 #temp index in data
+                for j in range(v_per_chunk):
+                    # Read raw ADC values (Current, Potential)
+                    adc_vals = np.frombuffer(data, np.float32, 2, temp_ind)
+                    temp_adc[i+j,:] = adc_vals
+                    temp_ind += 8
 
-        #Process the data
-        temp_adc = self._scale_output_voltages(temp_adc)
-        if self._auto_gain:
-            temp_adc[:,0] = np.divide(temp_adc[:,0],temp_res_val)
-            self.Resistor = temp_gain
-            self.ResistorVal = temp_res_val[-1]
-        else:
-            temp_adc[:,0] /= self.ResistorVal
-        temp_adc[:,0] *= -1
+                    # Check for Frame Shift via Potential Range (Approx +/- 15V limit)
+                    # Raw float interpretation of wrong bytes often yields huge numbers
+                    if np.any(np.abs(adc_vals) > 15.0):
+                         logger.warning("[PS %s] Frame shift detected! Invalid potential/current raw: %s",
+                                        self.device_ID, adc_vals)
+                         temp_adc[i+j,:] = np.nan
 
-        if pad_count == 0:
-            return temp_adc
-        
-        return temp_adc[:-pad_count,:] #get rid of the results of padding
+                    if self._auto_gain:
+                        temp_gain = int(np.frombuffer(data, np.uint8, 1, temp_ind)[0])
+                        temp_ind += 1
+
+                        # Validate Resistor Index
+                        if temp_gain in self.res_vals:
+                             temp_range[i+j] = temp_gain
+                        else:
+                             logger.warning("[PS %s] Frame shift detected! Invalid gain index: %s",
+                                            self.device_ID, temp_gain)
+                             temp_range[i+j] = 0
+                             temp_adc[i+j,:] = np.nan # Invalidate data too
+
+                fault = tracker.update(
+                    i, self._scale_output_voltages(temp_adc[i:i+v_per_chunk, 1]))
+                if fault:
+                    self._abort_waveform_run(fault)
+
+        return self._finish_batch_currents(temp_adc, temp_range, report,
+                                           v_count - pad_count, v_per_chunk, lead_in)
+
+    def _finish_batch_currents(self, raw, ranges, report, n_points, points_per_chunk,
+                               lead_in=0):
+        """A finished batch's readings as raw currents (A, column 0) and
+        potentials (V, column 1), lead-in and padding dropped; closes its run
+        report."""
+        out = self._scale_output_voltages(raw[lead_in:n_points])
+        amp_V = out[:, 0].copy()
+        ranges = np.asarray(ranges[lead_in:n_points], dtype=int)
+        out[:, 0] = -amp_V / self._res_table()[ranges]
+        report['lead_in'] = lead_in
+        self._finish_batch_report(report, n_points - lead_in, points_per_chunk,
+                                  ranges=ranges, amp_V=amp_V)
+        if len(ranges):
+            # The board stays on the range the run ended on
+            self.Resistor = int(ranges[-1])
+            self.ResistorVal = self.res_vals[self.Resistor]
+        return out
+
+    @staticmethod
+    def _auto_range_lead_in(range_period=1):
+        """Points to hold at the first potential before an auto-ranged run's
+        saved data: enough chances to change range to climb from the least
+        sensitive range to the most sensitive, as a whole number of periods so
+        a DPV's pulse pairs stay aligned with its range changes."""
+        period = max(1, int(range_period))
+        per_climb = period * int(np.ceil(AUTO_RANGE_UP_POINTS / period))
+        return per_climb * (len(RANGE_OHMS) - 1)
 
     def write_dac(self, channels, voltages):
         """Write Digital to Analog Converter values to potentiostat.
@@ -815,21 +1787,111 @@ class Potentiostat():
             rx_overflow: corrupted/oversized command frames discarded.
             starved_steps: sampling periods the device spent holding its
                 potential while waiting for waveform data from this computer.
+            rejected_setpoints: corrupted waveform points that made the device
+                stop the batch and disconnect the cell (firmware from
+                September 2026 onward; absent from older firmware's report).
+            late_steps, max_late_ms: batch steps that ran at least 1 ms after
+                they were due, and the worst lateness (ms).
+            resyncs: times the step schedule was re-anchored after a stall.
+            starve_aborts: batches the device ended, disconnecting the cell,
+                because waveform data stopped arriving.
+            features: capability flags (FW_FEATURE_*).
+            The last five come from firmware of late September 2026 onward.
 
-        After a clean run everything except a normal power-up flag is zero.
-        Non-zero counters mean the run was degraded and should be repeated.
+        Every counter except reset_flags, tx_dropped and rx_overflow describes
+        the most recent waveform upload. After a clean run everything except
+        a normal power-up flag is zero. Non-zero counters mean the run was
+        degraded and should be repeated.
         """
+        extra_len = 4 * (len(DIAGNOSTIC_FIELDS) - 4)
         with self._port_lock:
             self._write_cmd(Commands.READ_DIAGNOSTICS, None, False)
             result = self._read_with_retry(16, Commands.READ_DIAGNOSTICS, None)
-        vals = np.frombuffer(result, np.uint32)
-        return {
-            'reset_flags': int(vals[0]),
-            'watchdog_reset': bool(int(vals[0]) & (1 << 29)),  # IWDG flag bit
-            'tx_dropped': int(vals[1]),
-            'rx_overflow': int(vals[2]),
-            'starved_steps': int(vals[3]),
-        }
+            # Newer firmware appends more counters than the original four; a
+            # short read of the rest is how an older one shows where it stops
+            old_timeout = self.serial.timeout
+            try:
+                self.serial.timeout = 0.2
+                extra = self.serial.read(extra_len)
+            finally:
+                self.serial.timeout = old_timeout
+        raw = result + extra[:len(extra) - len(extra) % 4]
+        vals = np.frombuffer(raw, np.uint32)
+        report = {name: int(v) for name, v in zip(DIAGNOSTIC_FIELDS, vals)}
+        report['watchdog_reset'] = bool(report['reset_flags'] & (1 << 29))  # IWDG flag bit
+        return report
+
+    def _dac_V_per_cell_V(self):
+        """How far the DAC moves per volt of calibrated cell potential, along
+        the same path a batched waveform takes to the board."""
+        E = np.array([0.0, 0.1])
+        dac = self._scale_input_voltages(self._waveform_to_raw_V(E))
+        return float((dac[1] - dac[0]) / (E[1] - E[0]))
+
+    def _ir_factors(self, R_comp_ohm):
+        """The on-board iR loop's factor for each current range: DAC volts to
+        add per ADC volt the current channel reads away from its zero.
+
+        Worked out along the driver's own conversions (ADC volts -> amps with
+        the board's read calibration on that range; cell volts -> DAC volts
+        with its set calibration), so the correction applied on the board is
+        exactly ``R_comp_ohm`` times the current this driver records. Both
+        conversions are straight lines, so two points each fix them; the
+        zero is the board's own switch-open reading.
+        """
+        adc = np.array([1.0, 2.0])
+        amps_per_adc_V = []
+        for r in range(len(self.range_ohms)):
+            raw_A = -self._scale_output_voltages(adc) / self._res_table()[r]
+            I_A = self._calibrated_mA(raw_A, [r, r]) / 1000.0
+            amps_per_adc_V.append((I_A[1] - I_A[0]) / (adc[1] - adc[0]))
+        return (float(R_comp_ohm) * np.array(amps_per_adc_V)
+                * self._dac_V_per_cell_V())
+
+    def configure_ir_compensation(self, R_comp_ohm, step_ms, max_correction_V):
+        """Set up the on-board iR loop (firmware 1.8+) for the next batch run
+        with ``BATCH_FLAG_IR_COMP``: each setpoint gets ``R_comp_ohm`` times
+        the previous step's end-of-step current added, never more than
+        ``max_correction_V``, within the limits ``IR_MAX_STEP_V``,
+        ``IR_RUNAWAY_MS`` and ``IR_LIMIT_MS``.
+
+        Raises ``SerialAckError`` if the board refuses the configuration.
+        """
+        dac_per_V = abs(self._dac_V_per_cell_V())
+        max_dac = min(max(float(max_correction_V), IR_MIN_HEADROOM_V) * dac_per_V, 3.3)
+        step_dac = min(IR_MAX_STEP_V * dac_per_V, max_dac)
+        step_ms = max(float(step_ms), 1.0)
+        steps = [max(1, int(np.ceil(IR_RUNAWAY_MS / step_ms))),
+                 max(1, int(np.ceil(IR_LIMIT_MS / step_ms)))]
+        payload = (np.float32(self._ir_factors(R_comp_ohm)).tobytes()
+                   + np.float32([max_dac, step_dac, IR_FEEDBACK_ALPHA]).tobytes()
+                   + np.uint32(steps).tobytes())
+        self._write_cmd(Commands.IR_CONFIG, payload)
+
+    def read_ir_report(self):
+        """The on-board iR loop's report for the current waveform upload
+        (firmware 1.8+).
+
+        Returns:
+            dict: 'runs' (batches that compensated), 'limited_steps' (steps
+                the correction was held at its cap or the output at the DAC's
+                end), 'slewed_steps' (steps the correction trailed the
+                readings at its walking limit), 'runaway_aborts' and
+                'limit_aborts' (runs the board ended for each reason), and
+                'max_correction_V' / 'correction_V' (the largest correction
+                applied and the present one, in cell volts).
+        """
+        with self._port_lock:
+            self._write_cmd(Commands.IR_REPORT, None, False)
+            raw = self._read_with_retry(28, Commands.IR_REPORT, None)
+        runs, limited, slewed, runaways, limits = (
+            int(v) for v in np.frombuffer(raw, np.uint32, 5, 0))
+        largest, now = (float(v) for v in np.frombuffer(raw, np.float32, 2, 20))
+        dac_per_V = abs(self._dac_V_per_cell_V())
+        return {'runs': runs, 'limited_steps': limited, 'slewed_steps': slewed,
+                'runaway_aborts': runaways, 'limit_aborts': limits,
+                'max_correction_V': largest / dac_per_V,
+                'correction_V': now / dac_per_V}
 
     def write_gain(self, resistor: Resistors = Resistors.R_100):
         """Change gain by switching resistor between CE and WE
@@ -876,6 +1938,14 @@ class Potentiostat():
     _calib_intercept = 0.0
     _calib_read_slope = 0.9769
     _calib_read_intercept = -0.6
+
+    # Zero error removed from the read intercept by the last tare_current()
+    # (mA), kept so a repeated tare replaces it instead of stacking on it.
+    _current_tare_mA = 0.0
+
+    # A tare larger than this means the calibration or the board is badly
+    # off, not a small drift; it is still applied, but logged as a warning.
+    CURRENT_TARE_WARN_MA = 0.2
 
     # Nominal internal chain at the 100-ohm gain: while the firmware's hold
     # loop is converged, the board's own reading (mA) = 1.13 * command + 0.6.
@@ -948,6 +2018,8 @@ class Potentiostat():
         else:
             self._calib_read_slope = read_slope
             self._calib_read_intercept = read_intercept
+        # A fresh intercept supersedes any tare folded into the old one
+        self._current_tare_mA = 0.0
         logger.info("[PS %s] Calibration set: slope=%s, intercept=%s, "
                     "read_slope=%s, read_intercept=%s",
                     self.device_ID, self._calib_slope_correction,
@@ -1146,15 +2218,69 @@ class Potentiostat():
     
     def read_current_calibrated(self):
         """Return the current in mA, corrected by the board's read calibration."""
-        val_mA = self.read_current() * 1000.0
-        return val_mA * self._calib_read_slope + self._calib_read_intercept
+        raw_A = self.read_current()
+        return self._calibrated_mA(raw_A, self._range_index())
 
-    def calibrate_batch_current_uA(self, raw_A):
+    def tare_current(self, n_readings=10):
+        """Re-zero the current reading against the open circuit, like taring
+        a balance.
+
+        With the switch open no current can flow, so whatever the calibrated
+        reading shows is the chain's own zero error at the present gain. The
+        onboarding intercept is extrapolated from 0.1-20 mA points, and a
+        residual of a few tens of uA that is invisible there becomes a
+        baseline offset on uA-scale CVs — and, in iR runs, a phantom I*R_u
+        shift of the potential (bench 2026-09-21: +42 uA on board P, ~20 mV).
+        The median of ``n_readings`` is folded into the read intercept, so
+        every current path is corrected alike: single reads, the live iR
+        loop, batch streams, and step captures.
+
+        The zero error is a fixed voltage at the amplifier, so a tare taken
+        on one current range corrects every range; take it on the run's own
+        range anyway, which also removes that range's small leakage offset.
+        A repeated tare replaces the previous one, and
+        ``set_calibration_params`` clears it.
+
+        Args:
+            n_readings (int): Readings to take the median of. Default 10.
+
+        Returns:
+            float: The zero error removed, in mA.
+        """
+        if self._switch_state:
+            raise RuntimeError("tare_current needs the cell disconnected — "
+                               "open the switch first.")
+        # Undo the previous tare, so this one measures the stored zero afresh
+        self._calib_read_intercept += self._current_tare_mA
+        self._current_tare_mA = 0.0
+
+        zero_mA = float(np.median([float(self.read_current_calibrated()[0])
+                                   for _ in range(n_readings)]))
+        # The intercept is in range-0 terms (see _calibrated_mA)
+        index = self._range_index()
+        zero_range0_mA = zero_mA * self.range_ohms[index] / self.range_ohms[0]
+        self._calib_read_intercept -= zero_range0_mA
+        self._current_tare_mA = zero_range0_mA
+
+        if abs(zero_range0_mA) > self.CURRENT_TARE_WARN_MA:
+            logger.warning("[PS %s] Current tare removed %.1f uA — far more "
+                           "than drift; check this board's calibration.",
+                           self.device_ID, zero_mA * 1000.0)
+        else:
+            logger.info("[PS %s] Current tare removed %.1f uA.",
+                        self.device_ID, zero_mA * 1000.0)
+        return zero_mA
+
+    def calibrate_batch_current_uA(self, raw_A, ranges=None):
         """Convert raw batch-stream current (A) to uA with the board's read
         calibration — the same correction as ``read_current_calibrated``, for
-        the array data returned by the batch/streaming protocol."""
-        return (np.asarray(raw_A, dtype=float) * 1000.0 * self._calib_read_slope
-                + self._calib_read_intercept) * 1000.0
+        the array data returned by the batch/streaming protocol.
+
+        ``ranges`` gives the current range of each point (``last_batch_ranges``
+        after an auto-ranged run); by default, the range currently set."""
+        if ranges is None:
+            ranges = self._range_index()
+        return self._calibrated_mA(raw_A, ranges) * 1000.0
 
     def calibrate_batch_potential_V(self, raw_V):
         """Apply the board's voltage READ calibration to batch-stream
@@ -1206,7 +2332,7 @@ class Potentiostat():
 
         # Apply calibrations matches read_potential_calibrated and read_current_calibrated
         cal_v = raw_v * self._calib_v_read_slope + self._calib_v_read_intercept
-        cal_i = (raw_i * 1000.0) * self._calib_read_slope + self._calib_read_intercept
+        cal_i = float(self._calibrated_mA(raw_i, self._range_index()))
 
         return [cal_v, cal_i]
     
@@ -1268,72 +2394,38 @@ class Potentiostat():
 
     def _build_cv_waveform(self, min_V, max_V, cycles, step_V, start_V, last_V,
                            scan_direction='Negative'):
-        """Build the sequence of target potentials for a CV sweep.
+        """The target potentials for a CV sweep, shared by perform_CV and
+        perform_CV_iR so both drive an identical sweep shape (see
+        ``build_cv_waveform``)."""
+        return build_cv_waveform(min_V, max_V, cycles, step_V, start_V, last_V,
+                                 scan_direction)
 
-        Shared by perform_CV and perform_CV_iR so both drive an identical sweep
-        shape. A 'Negative' scan starts by going down to min_V; a 'Positive'
-        scan starts by going up to max_V.
+    def perform_CV(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None, last_V=None,
+                   scan_direction='Negative', quiet_s=DEFAULT_QUIET_S,
+                   current_range=None, ir_compensation_ohm=0.0):
+        """Performs CV with given parameters.
+
+        The device steps a whole number of milliseconds per point, so
+        ``step_hz`` is rounded to the nearest rate it can run (1000/delay)
+        and the potential step is sized for that real rate: the sweep runs at
+        ``mV_s`` whatever ``step_hz`` is. The cell is connected once the
+        waveform is loaded and held at the first potential for ``quiet_s``
+        before the sweep starts. ``current_range`` is ``'auto'`` or a range
+        index (see ``set_current_range``); None keeps the range already set.
+
+        ``ir_compensation_ohm`` above zero has the board add that resistance
+        times the current back onto each setpoint as the sweep runs (live iR
+        compensation, firmware 1.8+; see ``configure_ir_compensation``), as
+        far as the output has room beyond the sweep's largest potential. The
+        measured potential column then includes the applied correction.
+
+        Returns:
+            np.ndarray: columns time (s) of each sample from the sweep's
+                start, measured potential (V), current (uA), cycle number,
+                experiment number, target potential (V). How the run went
+                (sampling, step period, device health) is left in
+                ``last_batch_report``.
         """
-        cv = []
-
-        if scan_direction == 'Positive':
-            # POSITIVE SCAN: Start -> Max -> Min -> Max ... -> Last
-
-            # 1. Start to Max
-            r1 = np.abs(max_V - start_V)
-            if r1 > 0:
-                p1 = np.linspace(start_V, max_V, int(np.round(r1/step_V)))
-                cv = np.append(cv, p1)
-
-            # Cycle Loop
-            # For Positive scan, a full cycle is Max -> Min -> Max
-            r2 = np.abs(min_V - max_V) # Down
-            r3 = np.abs(max_V - min_V) # Up
-
-            p2 = np.linspace(max_V, min_V, int(np.round(r2/step_V)))
-            p3 = np.linspace(min_V, max_V, int(np.round(r3/step_V)))
-
-            for i in range(cycles):
-                cv = np.append(cv, p2)
-                cv = np.append(cv, p3)
-
-            # 4. Max to Last
-            r4 = np.abs(last_V - max_V)
-            if r4 > 0:
-                p4 = np.linspace(max_V, last_V, int(np.round(r4/step_V)))
-                cv = np.append(cv, p4)
-
-        else:
-            # NEGATIVE SCAN (Default/Legacy): Start -> Min -> Max -> Min ... -> Last
-
-            # 1. Start to Min
-            r1 = np.abs(min_V - start_V)
-            if r1 > 0:
-                p1 = np.linspace(start_V, min_V, int(np.round(r1/step_V)))
-                cv = np.append(cv, p1)
-
-            # Cycle Loop
-            # For Negative scan, a full cycle is Min -> Max -> Min
-            r2 = np.abs(max_V - min_V) # Up
-            r3 = np.abs(min_V - max_V) # Down
-
-            p2 = np.linspace(min_V, max_V, int(np.round(r2/step_V)))
-            p3 = np.linspace(max_V, min_V, int(np.round(r3/step_V)))
-
-            for i in range(cycles):
-                cv = np.append(cv, p2)
-                cv = np.append(cv, p3)
-
-            # 4. Min to Last
-            r4 = np.abs(last_V - min_V)
-            if r4 > 0:
-                p4 = np.linspace(min_V, last_V, int(np.round(r4/step_V)))
-                cv = np.append(cv, p4)
-
-        return cv
-
-    def perform_CV(self, min_V, max_V, cycles, mV_s, step_hz, start_V=None, last_V=None, scan_direction='Negative'):
-        """Performs CV with given parameters."""
 
         #Stop any running current-hold before the OCP read below opens the
         #switch, otherwise the firmware hold loop drives the DAC to its limit
@@ -1347,33 +2439,37 @@ class Potentiostat():
             if last_V is None:
                 last_V = ocp
 
-        # Park the DAC at the sweep's first potential BEFORE closing the
-        # switch, so the cell never sees a stale setpoint during the batch
-        # buffer pre-fill (bench-observed as ~2 s at an uncontrolled voltage).
+        # Park the DAC at the sweep's first potential while the cell is still
+        # disconnected, so the switch closes onto the right setpoint rather
+        # than a stale one (bench-observed as ~2 s at an uncontrolled voltage).
         # Uses the same set calibration as the batch points below, so the
         # handoff to the waveform's first point is seamless.
         self.write_potential_calibrated(start_V)
-        time.sleep(0.05)
-        self.write_switch(True)
 
-        V_s = mV_s / 1000
-        step_V = V_s / step_hz
+        delay_ms = max(1, int(np.round(1000 / step_hz)))
+        step_V = (mV_s / 1000) / (1000.0 / delay_ms)
 
         cv = self._build_cv_waveform(min_V, max_V, cycles, step_V,
                                      start_V, last_V, scan_direction)
 
-        rtn = self.write_voltage_batch(voltages = self._waveform_to_raw_V(cv),
-                                       delay = int(np.round(1000/step_hz)))
+        mode = self.set_current_range(current_range) if current_range is not None else None
+        lead_in = self._auto_range_lead_in() if mode == 'auto' else 0
+        ir = None
+        if ir_compensation_ohm > 0:
+            ir = {'ohm': float(ir_compensation_ohm),
+                  'max_correction_V': HW_VOLTAGE_COMPLIANCE_V - float(np.max(np.abs(cv)))}
+        rtn = self.write_voltage_batch(
+            voltages=self._waveform_to_raw_V(np.concatenate((np.full(lead_in, cv[0]), cv))),
+            delay=delay_ms,
+            before_start=lambda: self._connect_cell_for_batch(quiet_s),
+            auto_range=(mode == 'auto'), lead_in=lead_in, ir=ir)
         num_points = rtn.shape[0]
-        cycle_points = num_points // cycles
-        duration_s = num_points / step_hz
-        time_stamps = np.linspace(0, duration_s, num_points)
-        cycle_nums = np.zeros(num_points)
-        for i in range(0, cycles):
-            cycle_nums[i * cycle_points: (i + 1) * cycle_points] = np.full(cycle_points, i)
+        time_stamps = self._batch_time_axis(num_points)
+        cycle_nums = cv_cycle_numbers(cv, min_V, max_V, cycles)
         return np.column_stack((time_stamps,
                                 self.calibrate_batch_potential_V(rtn[:, 1]),
-                                self.calibrate_batch_current_uA(rtn[:, 0]),
+                                self.calibrate_batch_current_uA(rtn[:, 0],
+                                                                self.last_batch_ranges),
                                 cycle_nums, np.zeros(num_points), cv))
 
     # An exponential fit whose time constant is shorter than this many sample
@@ -1397,12 +2493,12 @@ class Potentiostat():
         link delivers it is already well down the decay.
 
         A trace with no visible decay is treated as purely resistive and
-        averaged directly (a dummy-cell resistor really behaves this way; for
-        a live cell it means the transient was too fast to catch, which the
-        message flags). A fitted time constant shorter than a couple of
-        sample intervals means the extrapolation is unconstrained, so the
-        measurement is refused rather than returning a number that cannot be
-        trusted.
+        extrapolated with a straight line (a dummy-cell resistor really
+        behaves this way; for a live cell it means the transient was too fast
+        or too slow to resolve, which the message flags). A fitted time
+        constant shorter than a couple of sample intervals means the
+        extrapolation is unconstrained, so the measurement is refused rather
+        than returning a number that cannot be trusted.
 
         Returns:
             dict: 'R_u_ohm', 'tau_ms' (None when no decay was fit), 'ok',
@@ -1440,12 +2536,20 @@ class Potentiostat():
         peak_dev = float(dev[peak_idx])
 
         if abs(peak_dev) < Potentiostat._RU_FLAT_DECAY_FRACTION * abs(tail_C):
-            I_flat = float(np.mean(currents_A))
+            # A straight line's value at t=0 rather than the plain mean, so a
+            # decay too slow to register here is still extrapolated back.
+            I_flat = (float(np.polyfit(times_ms, currents_A, 1)[1])
+                      if len(currents_A) >= 3 else float(np.mean(currents_A)))
+            if abs(I_flat) < 1e-9:
+                return {'R_u_ohm': float('inf'), 'tau_ms': None, 'ok': False,
+                        'I_at_0_A': None,
+                        'message': "extrapolated current at t=0 is zero — refused"}
             return {'R_u_ohm': abs(step_V / I_flat), 'tau_ms': None,
                     'ok': True, 'I_at_0_A': I_flat,
                     'message': ("no decay visible — treated as purely "
                                 "resistive; on a real cell this means the "
-                                "transient was too fast to sample")}
+                                "transient was too fast or too slow to "
+                                "resolve")}
 
         from scipy.optimize import curve_fit
 
@@ -1479,8 +2583,8 @@ class Potentiostat():
             return {'R_u_ohm': float('inf'), 'tau_ms': float(tau_ms),
                     'ok': False, 'I_at_0_A': None,
                     'message': (f"decay too fast to extrapolate (tau = "
-                                f"{tau_ms:.1f} ms vs {dt_ms:.1f} ms between "
-                                f"samples) — measurement refused")}
+                                f"{_format_ms(tau_ms)} vs {_format_ms(dt_ms)} "
+                                f"between samples) — measurement refused")}
 
         I_at_0 = I0 + C
         if abs(I_at_0) < 1e-9:
@@ -1490,6 +2594,124 @@ class Potentiostat():
 
         return {'R_u_ohm': abs(step_V / I_at_0), 'tau_ms': float(tau_ms),
                 'ok': True, 'I_at_0_A': float(I_at_0), 'message': ''}
+
+    @staticmethod
+    def _filtered_step_response(times_ms, A, tau_ms, C):
+        """What the board reads after a clean potential step (t=0 at the DAC
+        write) when the cell's own current is ``A*exp(-t/tau) + C``: that
+        current through the board's filters (``RU_FILTER_TAUS_MS``), each
+        reading averaged over its ADC conversions (``RU_ADC_WINDOW_MS``)."""
+        from scipy.signal import lfilter
+
+        times_ms = np.asarray(times_ms, dtype=float)
+        h = 0.00025  # 0.25 us grid, a sixth of the fastest filter
+        half = RU_ADC_WINDOW_MS / 2.0
+        grid = np.arange(0.0, float(np.max(times_ms)) + half + 2 * h, h)
+        y = A * np.exp(-grid / tau_ms) + C
+        for tf in RU_FILTER_TAUS_MS:
+            # Exact first-order low-pass for an input that is linear between
+            # grid points; the initial state makes the output start from
+            # zero, as it was before the step, however far the input jumps.
+            a = np.exp(-h / tf)
+            k = tf / h * (1.0 - a)
+            b0, b1 = 1.0 - k, k - a
+            y = lfilter([b0, b1], [1.0, -a], y, zi=[-b0 * y[0]])[0]
+        area = np.concatenate(([0.0], np.cumsum((y[1:] + y[:-1]) * 0.5 * h)))
+        lo = np.clip(times_ms - half, 0.0, None)
+        hi = np.clip(times_ms + half, 0.0, None)
+        return (np.interp(hi, grid, area) - np.interp(lo, grid, area)) / (2 * half)
+
+    @staticmethod
+    def _fit_ru_step_response(times_ms, currents_A, step_V):
+        """Estimate R_u from a DAC-step capture's current (t=0 at the step).
+
+        Fits the cell current ``A*exp(-t/tau) + C`` as the board reads it
+        (``_filtered_step_response``) and evaluates the cell current itself
+        at t=0, so R_u = step / (A + C). A trace that stays flat once the
+        filters have settled is a plain resistance, extrapolated with a
+        straight line. Refused: a fitted time constant under two sample
+        intervals, which cannot be extrapolated, and a current at t=0
+        uncertain by more than RU_MAX_I0_ERROR.
+
+        Returns:
+            dict: 'R_u_ohm', 'tau_ms' (None for a plain resistance), 'ok',
+                'I_at_0_A', and 'message' (empty when there is nothing to
+                flag), as ``_fit_ru_decay`` returns them.
+        """
+        from scipy.optimize import curve_fit
+
+        times_ms = np.asarray(times_ms, dtype=float)
+        currents_A = np.asarray(currents_A, dtype=float)
+        refused = {'R_u_ohm': float('inf'), 'tau_ms': None, 'ok': False,
+                   'I_at_0_A': None}
+        if len(currents_A) < 4 or np.max(np.abs(currents_A)) < 1e-9:
+            return dict(refused, message=("No current flowed — check the cell "
+                                          "connections and that the "
+                                          "electrolyte conducts."))
+
+        n_tail = max(3, len(currents_A) // 6)
+        noisy = ("the step current is too small against the noise to "
+                 "extrapolate (\u00b1{:.0%} at t=0) — increase the step size "
+                 "and re-measure")
+
+        # Flatness is judged once the filters have settled; before that even
+        # a plain resistance's current is still rising. A flat trace has no
+        # time constant for the fit to pin down, so it gets a straight line.
+        settled = times_ms >= 5.0 * max(RU_FILTER_TAUS_MS)
+        if settled.sum() >= 5:
+            ts, cs = times_ms[settled], currents_A[settled]
+            tail = float(np.mean(cs[-max(3, len(cs) // 6):]))
+            padded = np.concatenate(([cs[0]], cs, [cs[-1]]))
+            smoothed = np.convolve(padded, np.ones(3) / 3.0, mode='valid')
+            if (np.max(np.abs(smoothed - tail))
+                    < Potentiostat._RU_FLAT_DECAY_FRACTION * abs(tail)):
+                coef, cov = np.polyfit(ts, cs, 1, cov=True)
+                I_at_0 = float(coef[1])
+                if abs(I_at_0) < 1e-9:
+                    return dict(refused, message=("extrapolated current at t=0 "
+                                                  "is zero — refused"))
+                error = float(np.sqrt(cov[1, 1])) / abs(I_at_0)
+                if not error <= RU_MAX_I0_ERROR:
+                    return dict(refused, message=noisy.format(error))
+                return {'R_u_ohm': abs(step_V / I_at_0), 'tau_ms': None,
+                        'ok': True, 'I_at_0_A': I_at_0,
+                        'message': ("no decay visible — treated as purely "
+                                    "resistive; on a real cell this means the "
+                                    "transient was too fast or too slow to "
+                                    "resolve")}
+
+        C0 = float(np.mean(currents_A[-n_tail:]))
+        A0 = float(currents_A[0]) - C0
+        span_ms = max(times_ms[-1] - times_ms[0], 1e-3)
+        below = np.nonzero(np.abs(currents_A - C0) <= abs(A0) / np.e)[0]
+        tau0 = (max(times_ms[below[0]] - times_ms[0], 0.01) if len(below)
+                else span_ms)
+        try:
+            popt, pcov = curve_fit(Potentiostat._filtered_step_response,
+                                times_ms, currents_A, p0=[A0, tau0, C0],
+                                bounds=([-np.inf, 1e-4, -np.inf],
+                                        [np.inf, 1e3, np.inf]),
+                                maxfev=5000)
+        except (RuntimeError, ValueError):
+            return dict(refused, message=("the current transient did not fit "
+                                          "an exponential decay — measurement "
+                                          "refused"))
+
+        A, tau_ms, C = (float(v) for v in popt)
+        I_at_0 = A + C
+        if abs(I_at_0) < 1e-9:
+            return dict(refused, message="fitted current at t=0 is zero — refused")
+        error = float(np.sqrt(pcov[0, 0] + pcov[2, 2] + 2.0 * pcov[0, 2])) / abs(I_at_0)
+        if not error <= RU_MAX_I0_ERROR:
+            return dict(refused, tau_ms=tau_ms, message=noisy.format(error))
+        dt_ms = float(np.median(np.diff(times_ms)))
+        if tau_ms < Potentiostat._RU_MIN_TAU_INTERVALS * dt_ms:
+            return dict(refused, tau_ms=tau_ms,
+                        message=(f"decay too fast to extrapolate (tau = "
+                                 f"{_format_ms(tau_ms)} vs {_format_ms(dt_ms)} "
+                                 f"between samples) — measurement refused"))
+        return {'R_u_ohm': abs(step_V / I_at_0), 'tau_ms': tau_ms, 'ok': True,
+                'I_at_0_A': I_at_0, 'message': ''}
 
     def step_capture(self, n_samples, period_us):
         """Firmware-timed step-response capture (CMD_STEP_CAPTURE).
@@ -1558,7 +2780,66 @@ class Potentiostat():
         v_adc = np.asarray(counts, dtype=float) * ADC16_COUNTS_TO_V
         v = self._scale_output_voltages(v_adc)
         i_A = v / (-1.0 * self.res_vals[gain_idx])
-        return (i_A * 1000.0) * self._calib_read_slope + self._calib_read_intercept
+        return self._calibrated_mA(i_A, gain_idx)
+
+    def dac_step_capture(self, n_samples, period_us, n_pre, potential_V):
+        """Firmware-timed step capture with the step made by the DAC
+        (``Commands.DAC_STEP_CAPTURE``, firmware 1.7+).
+
+        With the cell already connected, the firmware records ``n_pre`` raw
+        current readings, moves the DAC to ``potential_V`` (calibrated, as
+        ``write_potential_calibrated`` takes it) and keeps sampling, so the
+        trace holds the cell's response to a clean step and its zero just
+        before it. The DAC is left at ``potential_V`` and the cell connected.
+
+        Returns:
+            tuple: ``(counts, duration_us, gain_idx, centre_us)`` — raw uint16
+                ADC counts, the capture's measured wall-clock duration, the
+                gain resistor index, and the time from the DAC write to the
+                middle of the first reading after it.
+
+        Raises:
+            RuntimeError: The cell was not connected, so nothing was captured.
+            SerialReadTimeout: No acknowledgement or a short readback.
+        """
+        slope = self._calib_v_slope
+        # Avoid div by zero on a malformed calibration row
+        if abs(slope) < 1e-6:
+            slope = 1.0
+        dac_V = float(self._scale_input_voltages(
+            (potential_V - self._calib_v_intercept) / slope))
+        n_samples = int(n_samples)
+        period_us = int(period_us)
+        request = (np.uint32([n_samples, period_us, int(n_pre)]).tobytes()
+                   + np.float32(dac_V).tobytes())
+        expected_s = n_samples * period_us / 1e6
+        with self._port_lock:
+            old_timeout = self.serial.timeout
+            try:
+                # The acknowledgement only arrives after the whole capture
+                self.serial.timeout = expected_s + 2.0
+                self._write_cmd(Commands.DAC_STEP_CAPTURE, request, False)
+                ack = self.serial.read(13)
+                if len(ack) < 13:
+                    raise SerialReadTimeout("No DAC-step capture acknowledgement")
+                captured = int(np.frombuffer(ack, np.uint32, 1, 0)[0])
+                duration_us = int(np.frombuffer(ack, np.uint32, 1, 4)[0])
+                gain_idx = int(ack[8])
+                centre_us = int(np.frombuffer(ack, np.uint32, 1, 9)[0]) / 1000.0
+                if captured == 0:
+                    raise RuntimeError("DAC-step capture refused: the cell is "
+                                       "not connected")
+                self._write_cmd(Commands._READ_BUFFER,
+                                np.uint32([0, captured * 2]), False)
+                raw = self.serial.read(captured * 2)
+                if len(raw) < captured * 2:
+                    raise SerialReadTimeout(
+                        f"DAC-step capture readback short: {len(raw)} of "
+                        f"{captured * 2} bytes")
+            finally:
+                self.serial.timeout = old_timeout
+        counts = np.frombuffer(raw, np.uint16).copy()
+        return counts, duration_us, gain_idx, centre_us
 
     def _acquire_step_trace(self, n_readings, capture_ms, capture_period_us):
         """Close the switch and record the post-step current transient.
@@ -1621,131 +2902,327 @@ class Potentiostat():
                 times_ms[i] = (time.time() - t0) * 1000.0
         return times_ms, currents_A - baseline_A, 'serial', baseline_A
 
+    @staticmethod
+    def _ru_blank_ms(times_ms, currents_A):
+        """How long the zero-step control capture shows the control
+        amplifier's recovery from the switch closing (see
+        RU_ARTIFACT_WINDOW_MS). Samples before this are left out of the fit.
+        """
+        times_ms = np.asarray(times_ms, dtype=float)
+        currents_A = np.asarray(currents_A, dtype=float)
+        if len(times_ms) < 2:
+            return RU_MIN_BLANK_MS
+        tail = currents_A[-max(3, len(currents_A) // 6):]
+        excursion = np.abs(currents_A - float(np.mean(tail)))
+        threshold = max(RU_ARTIFACT_SIGMAS * float(np.std(tail)),
+                        RU_ARTIFACT_FRACTION * float(excursion[0]), 1e-6)
+        off = (excursion > threshold) & (times_ms <= RU_ARTIFACT_WINDOW_MS)
+        if not off.any():
+            return RU_MIN_BLANK_MS
+        dt_ms = float(np.median(np.diff(times_ms)))
+        # Halfway past the following sample, which is skipped as margin
+        last_ms = float(times_ms[np.nonzero(off)[0][-1]])
+        return max(RU_MIN_BLANK_MS, last_ms + 1.5 * dt_ms)
+
+    @staticmethod
+    def _fit_ru_steps(up, down, control=None):
+        """R_u from two opposite step captures.
+
+        Fits the DIFFERENCE of the two step traces, which is the cell's
+        response to one step of twice the size: a constant current-reading
+        offset rides equally on both traces and cancels exactly, as does
+        anything else that does not reverse with the step. The fit covers the
+        first RU_FIT_WINDOW_MS of the transient, where the ohmic charging
+        current dominates the slower processes.
+
+        With a ``control`` capture the steps were made by closing the switch
+        (older firmware): the samples taken while the amplifier was still
+        recovering are skipped (the control shows for how long), each step's
+        current is measured from the control's level, and the difference is
+        fitted with a plain exponential. Without one they were made by the
+        DAC with the cell connected: each trace is already zeroed on its
+        readings before the step, and the fit models the board's filters
+        (``_fit_ru_step_response``) from RU_DAC_FIT_START_MS on.
+
+        Args:
+            up, down (dict): The positive and negative step captures, with
+                'times_ms' (t=0 at the step), 'currents_A' and 'step_V'; DAC
+                steps also carry 'pre_std_A', the noise before the step.
+            control (dict, optional): The zero-step switch-close capture, with
+                'times_ms', 'currents_A' and 'source' ('firmware' or 'serial').
+
+        Returns:
+            dict: 'R_u_ohm' (inf when refused), 'ok', 'message', 'tau_ms'
+                (None when no decay was fit), 'I_at_0_A' (of the difference),
+                'blank_ms' (where the fit starts), 'window_ms' (where it
+                ends), and 'rise_A' / 'fall_A' (each step's mean current over
+                the window's first RU_FIT_MIN_SAMPLES readings, from zero).
+        """
+        result = {'R_u_ohm': float('inf'), 'ok': False, 'message': '',
+                  'tau_ms': None, 'I_at_0_A': None, 'blank_ms': None,
+                  'window_ms': None, 'rise_A': None, 'fall_A': None}
+
+        t = np.asarray(up['times_ms'], dtype=float)
+        i_up = np.asarray(up['currents_A'], dtype=float)
+        # One time base for all: rail masking can drop different samples
+        # from each capture
+        i_down = np.interp(t, down['times_ms'], down['currents_A'])
+        if control is None:
+            blank_ms = RU_DAC_FIT_START_MS
+            i_zero = np.zeros_like(t)
+            noise = max(float(up.get('pre_std_A', 0.0)),
+                        float(down.get('pre_std_A', 0.0)))
+        else:
+            # The serial fallback's first reading lands one round trip
+            # (~3 ms) after the switch closes, long after the recovery
+            if control.get('source', 'firmware') == 'firmware':
+                blank_ms = Potentiostat._ru_blank_ms(control['times_ms'],
+                                                     control['currents_A'])
+            else:
+                blank_ms = 0.0
+            i_zero = np.interp(t, control['times_ms'], control['currents_A'])
+            c_i = np.asarray(control['currents_A'], dtype=float)
+            noise = float(np.std(c_i[-max(3, len(c_i) // 6):]))
+        result['blank_ms'] = blank_ms
+        if blank_ms > RU_MAX_BLANK_MS:
+            result['message'] = (
+                f"the amplifier took {_format_ms(blank_ms)} to settle after "
+                f"the cell was connected, which hides the transient — "
+                f"measurement refused")
+            return result
+
+        after = np.nonzero(t >= blank_ms)[0]
+        if len(after) < 3:
+            result['message'] = ("too few samples after the step — "
+                                 "measurement refused")
+            return result
+        end_ms = max(t[after[0]] + RU_FIT_WINDOW_MS,
+                     t[after[min(len(after), RU_FIT_MIN_SAMPLES) - 1]])
+        win = after[t[after] <= end_ms]
+        result['window_ms'] = float(t[win[-1]])
+
+        # Each step's own current, which must clear the noise and point the
+        # way its step does. Taken over the window's first readings, where
+        # even a fast cell's current has not yet decayed away.
+        head = win[:RU_FIT_MIN_SAMPLES]
+        rise = float(np.mean(i_up[head] - i_zero[head]))
+        fall = float(np.mean(i_zero[head] - i_down[head]))
+        result['rise_A'], result['fall_A'] = rise, fall
+        noise /= np.sqrt(len(head))
+        for drawn, step in ((rise, up), (fall, down)):
+            if drawn <= 0:
+                result['message'] = (
+                    f"the {step['step_V'] * 1e3:+.0f} mV step drew current "
+                    f"against its own direction — check the cell connections, "
+                    f"and rest the cell away from any redox wave — "
+                    f"measurement refused")
+                return result
+            if drawn <= max(5.0 * noise, 1e-9):
+                result['message'] = (
+                    f"the {step['step_V'] * 1e3:+.0f} mV step drew only "
+                    f"{drawn * 1e6:.1f} \u00b5A, too little to measure against "
+                    f"the noise — check the cell connections, or increase the "
+                    f"step size — measurement refused")
+                return result
+        if max(rise, fall) > RU_MAX_ASYMMETRY * min(rise, fall):
+            result['message'] = (
+                f"the two steps drew very different currents "
+                f"({rise * 1e6:.0f} vs {fall * 1e6:.0f} µA), so something "
+                f"other than solution resistance dominates, most likely "
+                f"faradaic current from a step onto a redox wave — rest the "
+                f"cell away from any wave, or reduce the step, and re-measure")
+            return result
+
+        fit_fn = (Potentiostat._fit_ru_step_response if control is None
+                  else Potentiostat._fit_ru_decay)
+        fit = fit_fn(t[win], i_up[win] - i_down[win],
+                     up['step_V'] - down['step_V'])
+        result.update(R_u_ohm=fit['R_u_ohm'], ok=fit['ok'],
+                      message=fit['message'], tau_ms=fit['tau_ms'],
+                      I_at_0_A=fit['I_at_0_A'])
+        return result
+
+    def _check_step_targets(self, ocp, step_mV):
+        """Refuse R_u steps the board cannot reach from ``ocp``."""
+        for polarity in (+1.0, -1.0):
+            E_step = ocp + polarity * step_mV / 1000.0
+            if abs(E_step) > HW_VOLTAGE_COMPLIANCE_V:
+                raise ValueError(
+                    f"Step target {E_step:.3f} V is beyond the board's "
+                    f"output limit ({HW_VOLTAGE_COMPLIANCE_V} V). Reduce "
+                    f"step_mV.")
+
+    def _switch_step_traces(self, step_mV, n_readings, settle_s):
+        """The two R_u steps made by closing the switch (firmware before
+        1.7), plus the zero-step control capture before them.
+
+        Returns:
+            tuple: ``(control, [up, down])``, as ``_fit_ru_steps`` takes them.
+                The switch is left open.
+        """
+        # Control capture: park at OCP itself and record the switch closing
+        # with zero driving force, which shows how long the instrument takes
+        # to recover.
+        ocp0 = float(self.read_ocp(restore_switch_state=False))
+        self._check_step_targets(ocp0, step_mV)
+        self.write_potential_calibrated(ocp0)
+        time.sleep(settle_s)
+        c_times, c_currents, c_source, c_baseline = \
+            self._acquire_step_trace(n_readings, RU_CAPTURE_MS,
+                                     RU_CAPTURE_PERIOD_US)
+        self._safe_open_switch()
+        control = {'times_ms': c_times, 'currents_A': c_currents,
+                   'baseline_A': c_baseline, 'ocp': ocp0,
+                   'source': c_source}
+        logger.info("[PS %s] R_u control (no step, %s): OCP=%.4f V, "
+                    "baseline=%.1f uA, first sample=%.1f uA",
+                    self.device_ID, c_source, ocp0, c_baseline * 1e6,
+                    float(c_currents[0]) * 1e6)
+
+        traces = []
+        for polarity in (+1.0, -1.0):
+            step_V = polarity * step_mV / 1000.0
+
+            # read_ocp leaves the switch open, which is where the step
+            # begins; re-read before each step because OCP drifts while the
+            # cell recovers from the previous one.
+            ocp = float(self.read_ocp(restore_switch_state=False))
+            self._check_step_targets(ocp, step_mV)
+
+            # Park the DAC at the step potential before connecting the cell,
+            # so the step is as sharp as the hardware allows.
+            self.write_potential_calibrated(ocp + step_V)
+            time.sleep(settle_s)
+
+            times_ms, currents_A, source, baseline_A = \
+                self._acquire_step_trace(
+                    n_readings, RU_CAPTURE_MS, RU_CAPTURE_PERIOD_US)
+
+            self._safe_open_switch()
+
+            traces.append({'step_V': step_V, 'ocp': ocp, 'source': source,
+                           'baseline_A': baseline_A, 'times_ms': times_ms,
+                           'currents_A': currents_A})
+            logger.info("[PS %s] R_u step %+.0f mV (%s): OCP=%.4f V, "
+                        "baseline=%.1f uA, first sample=%.1f uA",
+                        self.device_ID, step_V * 1e3, source, ocp,
+                        baseline_A * 1e6, float(currents_A[0]) * 1e6)
+        return control, traces
+
+    def _dac_step_traces(self, step_mV, settle_s):
+        """The two R_u steps made by the DAC with the cell connected
+        (firmware 1.7+).
+
+        The cell is connected at its open-circuit potential and held there
+        for ``settle_s``, long enough for the switch-close transient to die
+        away; each step then starts from rest, and the cell goes back to OCP
+        for ``settle_s`` before the next one. Each trace is zeroed on its
+        own readings from just before its step.
+
+        Returns:
+            list: ``[up, down]``, as ``_fit_ru_steps`` takes them. The switch
+                is left open.
+        """
+        ocp = float(self.read_ocp(restore_switch_state=False))
+        self._check_step_targets(ocp, step_mV)
+        self.write_potential_calibrated(ocp)
+        self.write_switch(SwitchState.On)
+
+        period_ms = RU_CAPTURE_PERIOD_US / 1000.0
+        n_samples = RU_PRE_SAMPLES + int(round(RU_CAPTURE_MS / period_ms))
+        traces = []
+        for polarity in (+1.0, -1.0):
+            step_V = polarity * step_mV / 1000.0
+            time.sleep(settle_s)
+            counts, duration_us, gain_idx, centre_us = self.dac_step_capture(
+                n_samples, RU_CAPTURE_PERIOD_US, RU_PRE_SAMPLES, ocp + step_V)
+            self.write_potential_calibrated(ocp)
+            if duration_us > 1.02 * len(counts) * RU_CAPTURE_PERIOD_US:
+                logger.warning("[PS %s] R_u capture ran slow (%d us for %d "
+                               "samples); its time axis is approximate.",
+                               self.device_ID, duration_us, len(counts))
+
+            times_ms = ((np.arange(len(counts)) - RU_PRE_SAMPLES) * period_ms
+                        + centre_us / 1000.0)
+            currents_A = self._capture_counts_to_mA(counts, gain_idx) / 1000.0
+            # Railed samples (ADC pinned at either end) carry no amplitude
+            # information and would drag the fit
+            ok = (counts > 100) & (counts < 65435)
+            pre = currents_A[:RU_PRE_SAMPLES][ok[:RU_PRE_SAMPLES]]
+            baseline_A = float(np.mean(pre)) if len(pre) else 0.0
+            pre_std_A = float(np.std(pre)) if len(pre) > 1 else 0.0
+            if ok.sum() >= 10:
+                times_ms, currents_A = times_ms[ok], currents_A[ok]
+            traces.append({'step_V': step_V, 'ocp': ocp, 'source': 'dac-step',
+                           'baseline_A': baseline_A, 'pre_std_A': pre_std_A,
+                           'times_ms': times_ms,
+                           'currents_A': currents_A - baseline_A})
+            logger.info("[PS %s] R_u step %+.0f mV (DAC, cell connected): "
+                        "OCP=%.4f V, zero before step=%.1f uA (noise %.1f uA), "
+                        "first reading %s after the step",
+                        self.device_ID, step_V * 1e3, ocp, baseline_A * 1e6,
+                        pre_std_A * 1e6, _format_ms(centre_us / 1000.0))
+        self._safe_open_switch()
+        return traces
+
     def measure_R_u(self, step_mV=50.0, n_readings=30, settle_s=2.0):
         """Measure the cell's uncompensated (solution) resistance, R_u.
 
         Applies a small, sudden potential step away from OCP and records the
-        current decay. On firmware with CMD_STEP_CAPTURE the decay is sampled
-        on-device from within microseconds of the step (see
-        ``_acquire_step_trace``); otherwise it is read over the serial link,
-        one round trip per point. Either way the decay is fitted with an
-        exponential and extrapolated back to the instant of the step, when
-        the cell behaved like a plain resistor, giving R_u = step / I(0).
+        current decay, sampled by the firmware from within microseconds of
+        the step. The decay is fitted with an exponential and extrapolated
+        back to the instant of the step, when the cell behaved like a plain
+        resistor, giving R_u = step / I(0).
 
-        The step is made twice, once in each direction from OCP. Alternating
-        polarity cancels the drift a single repeated step leaves behind, and
-        the primary estimate is taken from the DIFFERENCE of the two
-        extrapolated t=0 currents, so any constant current-reading offset —
-        which rides equally on both polarities and is the same order as the
-        transient currents themselves — cancels exactly. Each trace is
-        additionally zeroed against a switch-open baseline read just before
-        its step.
+        The step is made twice, once in each direction from OCP, and the fit
+        is made to the DIFFERENCE of the two traces (see ``_fit_ru_steps``),
+        so any constant current-reading offset — which rides equally on both
+        and is the same order as the transient currents themselves — cancels
+        exactly. Alternating the direction also cancels the drift a single
+        repeated step leaves behind.
 
-        Before the two steps, a CONTROL capture is taken with the DAC parked
-        at OCP itself: no driving force, so no ohmic or charging current,
-        and whatever transient it records is the instrument's own
-        switch-close artifact (charge injection, amplifier settling —
-        bench-observed as a one-sample spike). That template is subtracted
-        from both step traces, so the artifact is measured out rather than
-        fitted around.
+        On firmware 1.7+ (``FW_FEATURE_DAC_STEP``) the steps are made by the
+        DAC with the cell connected at OCP (``_dac_step_traces``): the trace
+        is the cell's response through the board's known filters, from the
+        first microseconds. Older firmware makes them by closing the switch
+        onto a DAC already parked at the step potential
+        (``_switch_step_traces``), whose first ~75 us are the control
+        amplifier recovering from the open switch. The recovery also pushes
+        charge into the double layer before the fit starts, which reads R_u
+        high; and without CMD_STEP_CAPTURE at all, the decay is read over the
+        serial link, one round trip (~3 ms) per point.
 
         Args:
             step_mV (float): Step size in mV. Keep it small (20–100 mV) so the
                 step does not drive a reaction. Default 50 mV.
             n_readings (int): Number of current readings per step when the
                 serial fallback is used. Default 30.
-            settle_s (float): Hold time at the parked potential before each
-                step, to let the cell relax. Default 2.0 s.
+            settle_s (float): Hold time at rest before each step, to let the
+                cell relax. Default 2.0 s.
 
         Returns:
-            dict: 'R_u_ohm' (inf when refused), 'fit_ok', 'message',
-                'polarities' (per-step fits and full decay traces), plus the
-                legacy keys 'step_V', 'I_peak_A', 'times_ms', 'currents_A'
-                describing the first step.
+            dict: 'R_u_ohm' (inf when refused), 'fit_ok', 'message', 'fit'
+                (the combined fit's details, see ``_fit_ru_steps``),
+                'polarities' (each step's full trace), 'control' (None for
+                DAC steps), plus the legacy keys 'step_V', 'I_peak_A',
+                'times_ms', 'currents_A' describing the first step.
         """
         # Force the 100 ohm gain: the current spike right after the step would
         # saturate a higher-gain resistor and clip the transient this
         # measurement depends on.
         prev_gain = getattr(self, 'Resistor', Resistors.R_100)
         prev_auto = self._auto_gain
+        features = getattr(self, 'firmware_features', lambda: 0)()
 
-        polarities = []
         control = None
-
         try:
             self.write_auto_gain(False)
             self.write_gain(Resistors.R_100)
-
-            # Control capture: park at OCP itself and record the switch
-            # closing with zero driving force. This trace IS the instrument
-            # artifact, and is subtracted from both step traces below.
-            ocp0 = float(self.read_ocp(restore_switch_state=False))
-            self.write_potential_calibrated(ocp0)
-            time.sleep(settle_s)
-            c_times, c_currents, c_source, c_baseline = \
-                self._acquire_step_trace(n_readings, RU_CAPTURE_MS,
-                                         RU_CAPTURE_PERIOD_US)
-            self._safe_open_switch()
-            control = {'times_ms': c_times, 'currents_A': c_currents,
-                       'baseline_A': c_baseline, 'ocp': ocp0,
-                       'source': c_source}
-            logger.info("[PS %s] R_u control (no step, %s): OCP=%.4f V, "
-                        "baseline=%.1f uA, artifact peak=%.1f uA",
-                        self.device_ID, c_source, ocp0, c_baseline * 1e6,
-                        float(np.max(np.abs(c_currents))) * 1e6)
-
-            for polarity in (+1.0, -1.0):
-                step_V = polarity * step_mV / 1000.0
-
-                # read_ocp leaves the switch open, which is where the step
-                # begins; re-read before each step because OCP drifts while
-                # the cell recovers from the previous one.
-                ocp = float(self.read_ocp(restore_switch_state=False))
-
-                E_step = ocp + step_V
-                if abs(E_step) > HW_VOLTAGE_COMPLIANCE_V:
-                    raise ValueError(
-                        f"Step target {E_step:.3f} V is beyond the board's "
-                        f"output limit ({HW_VOLTAGE_COMPLIANCE_V} V). Reduce "
-                        f"step_mV.")
-
-                # Park the DAC at the step potential before connecting the
-                # cell, so the step is as sharp as the hardware allows.
-                self.write_potential_calibrated(E_step)
-                time.sleep(settle_s)
-
-                times_ms, currents_A, source, baseline_A = \
-                    self._acquire_step_trace(
-                        n_readings, RU_CAPTURE_MS, RU_CAPTURE_PERIOD_US)
-
-                self._safe_open_switch()
-
-                # Remove the instrument's switch-close artifact, measured by
-                # the control capture: the template is the control minus its
-                # own settled tail (so no DC transfers), applied only inside
-                # the artifact window (so tail noise and OCP drift do not
-                # leak in). Interpolation tolerates rail-masking having
-                # dropped different samples from the two traces.
-                c_t = control['times_ms']
-                c_i = control['currents_A']
-                c_tail = float(np.mean(c_i[-max(3, len(c_i) // 6):]))
-                template = np.interp(times_ms, c_t, c_i - c_tail)
-                template[times_ms > RU_ARTIFACT_WINDOW_MS] = 0.0
-                currents_A = currents_A - template
-
-                fit = self._fit_ru_decay(times_ms, currents_A, step_V)
-                fit.update(step_V=step_V, ocp=ocp, source=source,
-                           baseline_A=baseline_A,
-                           times_ms=times_ms, currents_A=currents_A)
-                polarities.append(fit)
-
-                logger.info("[PS %s] R_u step %+.0f mV (%s): OCP=%.4f V, "
-                            "baseline=%.1f uA, tau=%s ms, R_u=%.1f ohm, "
-                            "ok=%s %s",
-                            self.device_ID, step_V * 1e3, source, ocp,
-                            baseline_A * 1e6,
-                            ('%.1f' % fit['tau_ms']) if fit['tau_ms'] is not None else '-',
-                            fit['R_u_ohm'], fit['ok'], fit['message'])
+            if features & FW_FEATURE_DAC_STEP:
+                polarities = self._dac_step_traces(step_mV, settle_s)
+            else:
+                control, polarities = self._switch_step_traces(
+                    step_mV, n_readings, settle_s)
 
         except Exception:
             self.write_switch(SwitchState.Off)  # Fail-state: cut the output before raising
@@ -1760,82 +3237,27 @@ class Potentiostat():
                 logger.warning("[PS %s] Could not restore the gain setting "
                                "after the R_u measurement.", self.device_ID)
 
-        good = [p for p in polarities if p['ok']]
-        # A polarity that went through the flat "resistive" branch has no
-        # fitted time constant; one with a real fitted transient is the more
-        # trustworthy of the two when they disagree.
-        proper = [p for p in good if p['tau_ms'] is not None]
-        flat = [p for p in good if p['tau_ms'] is None]
-
-        if good:
-            use = good
-            fit_ok = True
-            notes = []
-            lo, hi = (sorted(p['R_u_ohm'] for p in good) + [0, 0])[:2]
-            disagree = (len(good) == 2) and (hi > 1.25 * lo)
-
-            # Offset-immune combined estimate: a constant reading offset adds
-            # the same phantom current to both polarities, and cancels in the
-            # difference of the two extrapolated t=0 currents. Valid when
-            # both polarities carry ohmic information — two fitted
-            # transients, or two agreeing flat (resistive) traces. A flat
-            # trace that disagrees with a fitted one is faradaic, and its
-            # current would poison the difference.
-            R_diff = None
-            if (len(good) == 2
-                    and all(p['I_at_0_A'] is not None for p in good)
-                    and (len(proper) == 2 or (len(flat) == 2 and not disagree))):
-                dI = good[0]['I_at_0_A'] - good[1]['I_at_0_A']
-                dE = good[0]['step_V'] - good[1]['step_V']
-                if abs(dI) > 1e-9:
-                    R_diff = abs(dE / dI)
-
-            if disagree and len(proper) == 1:
-                # A genuine resistance is symmetric; the flat polarity is
-                # sustained faradaic current, not R_u — drop it.
-                use = proper
-                notes.append(f"the {flat[0]['step_V'] * 1e3:+.0f} mV step "
-                             f"showed no transient ({flat[0]['R_u_ohm']:.0f} "
-                             f"ohm apparent, likely sustained faradaic "
-                             f"current) and was ignored")
-            elif disagree and len(proper) == 0:
-                fit_ok = False
-            elif disagree and R_diff is not None:
-                notes.append(f"per-step estimates disagree ({lo:.0f} vs "
-                             f"{hi:.0f} ohm) — consistent with a constant "
-                             f"reading offset, which the combined estimate "
-                             f"cancels")
-            elif disagree:
-                notes.append(f"the two step polarities disagree "
-                             f"({lo:.0f} vs {hi:.0f} ohm) — let the cell "
-                             f"rest and measure again")
-            notes = sorted({p['message'] for p in use if p['message']}) + notes
-
-            if fit_ok:
-                if R_diff is not None:
-                    R_u = float(R_diff)
-                else:
-                    R_u = float(np.mean([p['R_u_ohm'] for p in use]))
-                message = "; ".join(notes)
-            else:
-                R_u = float('inf')
-                message = (f"both step polarities were flat yet disagree "
-                           f"({lo:.0f} vs {hi:.0f} ohm) — sustained faradaic "
-                           f"current suspected, not solution resistance; "
-                           f"reduce the step size and re-measure")
-                logger.warning("[PS %s] R_u refused: %s", self.device_ID, message)
+        fit = self._fit_ru_steps(*polarities, control=control)
+        if fit['ok']:
+            logger.info("[PS %s] R_u = %.1f ohm (%s steps, fit from %s to %s, "
+                        "tau %s, step currents %.1f / %.1f uA) %s",
+                        self.device_ID, fit['R_u_ohm'],
+                        'DAC' if control is None else 'switch',
+                        _format_ms(fit['blank_ms']),
+                        _format_ms(fit['window_ms']),
+                        (_format_ms(fit['tau_ms']) if fit['tau_ms'] is not None else '-'),
+                        fit['rise_A'] * 1e6, fit['fall_A'] * 1e6,
+                        fit['message'])
         else:
-            R_u = float('inf')
-            fit_ok = False
-            message = "; ".join(sorted({p['message'] for p in polarities
-                                        if p['message']})) or "measurement failed"
-            logger.warning("[PS %s] R_u refused: %s", self.device_ID, message)
+            logger.warning("[PS %s] R_u refused: %s", self.device_ID,
+                           fit['message'])
 
         first = polarities[0]
         return {
-            'R_u_ohm':    R_u,
-            'fit_ok':     fit_ok,
-            'message':    message,
+            'R_u_ohm':    float(fit['R_u_ohm']),
+            'fit_ok':     bool(fit['ok']),
+            'message':    fit['message'],
+            'fit':        fit,
             'polarities': polarities,
             'control':    control,
             'step_V':     first['step_V'],
@@ -1849,7 +3271,8 @@ class Potentiostat():
                       compensation_fraction=0.7, max_consecutive_timeouts=5,
                       data_callback=None, stop_event=None, callback_block=6,
                       feedback_median=3, feedback_alpha=0.4,
-                      correction_slew_V=0.010, freeze_auto_gain=True):
+                      correction_slew_V=0.010, freeze_auto_gain=True,
+                      quiet_s=DEFAULT_QUIET_S, current_range=None):
         """Run a CV with live software iR compensation (advanced).
 
         Solution resistance means the electrode never quite reaches the
@@ -1921,6 +3344,12 @@ class Potentiostat():
             freeze_auto_gain (bool): Disable auto-gain for the scan and
                 restore it afterwards, so range changes cannot feed a
                 mis-scaled sample into the setpoint. Default True.
+            quiet_s (float): Time the connected cell is held at the first
+                potential before the scan starts, as in perform_CV.
+            current_range: a fixed range index for the scan (see
+                ``set_current_range``), or None to keep the range already
+                set. Point-by-point control cannot auto-range, so ``'auto'``
+                runs the scan on range 0.
 
         Returns:
             np.ndarray: same columns as perform_CV — time (s), measured
@@ -1970,6 +3399,10 @@ class Potentiostat():
         consecutive_timeouts = 0
         capped = False
 
+        if current_range is not None:
+            self.set_current_range(Resistors.R_100 if current_range == 'auto'
+                                   else current_range)
+
         # A mid-wave gain change can hand the feedback a mis-scaled sample,
         # so the gain is held fixed for the whole scan by default.
         prev_auto_gain = self._auto_gain
@@ -1981,7 +3414,6 @@ class Potentiostat():
         self.write_potential_calibrated(cv[0])
         time.sleep(0.05)
         self.write_switch(SwitchState.On)
-        t_start = time.time()
 
         points_done = num_points
         block_start = 0
@@ -1997,6 +3429,8 @@ class Potentiostat():
                 logger.warning("[PS %s] Live callback error: %s", self.device_ID, e)
 
         try:
+            self._quiet_wait(quiet_s, stop_event)
+            t_start = time.time()
             for i in range(num_points):
                 # Check for a stop before driving the next point, so a stopped
                 # scan never applies a potential it will not read back
@@ -2096,43 +3530,55 @@ class Potentiostat():
         measured_I_mA = measured_I_mA[:points_done]
         actual_times = actual_times[:points_done]
         cv = cv[:points_done]
-
-        cycle_points = num_points // cycles if cycles > 0 else num_points
-        cycle_nums = np.zeros(points_done)
-        for i in range(0, cycles):
-            start = i * cycle_points
-            if start >= points_done:
-                break
-            cycle_nums[start: min((i + 1) * cycle_points, points_done)] = i
+        cycle_nums = cv_cycle_numbers(cv, min_V, max_V, cycles)
 
         return np.column_stack((actual_times, measured_V, measured_I_mA * 1000.0,
                                 cycle_nums, np.zeros(points_done), cv))
 
-    def perform_DPV(self, waveform, start_V, sample_hz):
+    def perform_DPV(self, waveform, start_V=None, sample_hz=250,
+                    quiet_s=DEFAULT_QUIET_S, current_range=None, range_period=1):
         """Run a pre-built DPV target waveform and stream the response.
 
         The staircase-plus-pulse waveform is built by
         ``moles.methods.dpv.build_dpv_waveform``, which is where the sweep shape
         (single-sweep or cyclic segments) is decided; this method only drives
-        the hardware. ``waveform`` is the per-sample target-potential array and
-        ``start_V`` is the potential the DAC is parked at before the cell switch
-        closes.
+        the hardware. ``waveform`` is the per-sample target-potential array.
+        The DAC is parked at ``start_V`` (default: the waveform's first point,
+        which makes the handoff seamless) before the cell is connected, and
+        the cell is held there for ``quiet_s`` before the waveform starts.
+        ``current_range`` is as for perform_CV; ``range_period`` is the
+        waveform's step-plus-pulse length in points, so an auto-ranged run
+        changes range only between pulse pairs.
 
         Returns:
-            2 columns, column 0: I (A) | column 1: V
+            np.ndarray: one row per waveform point, columns time (s) of each
+                sample, measured potential (V), current (uA) and target
+                potential (V), calibrated like perform_CV's. How the run went
+                is left in ``last_batch_report``.
         """
+        waveform = np.asarray(waveform, dtype=float)
+        if start_V is None:
+            start_V = waveform[0]
         self.write_current_hold_stop()
-        # Park the DAC at the waveform's first potential before closing the
-        # switch — same stale-setpoint protection as perform_CV — so the cell
-        # never sits at a stale setpoint while the batch buffer pre-fills.
+        # Park the DAC at the waveform's first potential while the cell is
+        # still disconnected — same stale-setpoint protection as perform_CV.
         self.write_potential_calibrated(start_V)
-        time.sleep(0.05)
-        self.write_switch(True)
 
         step_ms = int(np.round(np.ceil(1000 / sample_hz)))
-        return self.write_voltage_batch(
-            voltages=self._waveform_to_raw_V(waveform), delay=step_ms
-        )
+        mode = self.set_current_range(current_range) if current_range is not None else None
+        lead_in = self._auto_range_lead_in(range_period) if mode == 'auto' else 0
+        rtn = self.write_voltage_batch(
+            voltages=self._waveform_to_raw_V(
+                np.concatenate((np.full(lead_in, waveform[0]), waveform))),
+            delay=step_ms,
+            before_start=lambda: self._connect_cell_for_batch(quiet_s),
+            auto_range=(mode == 'auto'), range_period=range_period, lead_in=lead_in)
+        n = rtn.shape[0]
+        return np.column_stack((self._batch_time_axis(n),
+                                self.calibrate_batch_potential_V(rtn[:, 1]),
+                                self.calibrate_batch_current_uA(rtn[:, 0],
+                                                                self.last_batch_ranges),
+                                waveform[:n]))
 
     def perform_CDPV(self,
                      min_V: float,
@@ -2194,6 +3640,7 @@ class Potentiostat():
 
         dpv = np.append(dpv, hold(start_V, potential_hold_ms))
         rtn = self.write_voltage_batch(voltages=self._waveform_to_raw_V(dpv), delay=step_ms)
+        ranges = self.last_batch_ranges
         num_points = rtn.shape[0]
         cycle_points = num_points // cycles
         duration_s = num_points/sample_hz
@@ -2203,7 +3650,7 @@ class Potentiostat():
             cycle_nums[i * cycle_points: (i+1) * cycle_points] = np.full(cycle_points, i)
         return np.column_stack((time_stamps,
                                 self.calibrate_batch_potential_V(rtn[:, 1]),
-                                self.calibrate_batch_current_uA(rtn[:, 0]),
+                                self.calibrate_batch_current_uA(rtn[:, 0], ranges),
                                 cycle_nums, np.zeros(num_points), dpv))
 
     def process_CDPV(self, data: np.ndarray, file_basename: Union[str, Path]):

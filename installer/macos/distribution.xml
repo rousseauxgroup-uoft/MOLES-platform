@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Installer wizard for MOLES-<version>.pkg; build_pkg.sh fills in @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>MOLES</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <!-- Both chips run it natively: the postinstall step downloads the
+         matching Python, so Apple Silicon never asks for Rosetta. -->
+    <options customize="never" require-scripts="true" hostArchitectures="x86_64,arm64"/>
+    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="12.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="moles"/>
+    </choices-outline>
+    <choice id="moles" title="MOLES" visible="false">
+        <pkg-ref id="ca.utoronto.rousseauxgroup.moles.pkg"/>
+    </choice>
+    <pkg-ref id="ca.utoronto.rousseauxgroup.moles.pkg" version="@VERSION@" onConclusion="none">moles-component.pkg</pkg-ref>
+</installer-gui-script>

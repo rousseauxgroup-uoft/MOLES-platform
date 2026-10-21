@@ -1,0 +1,14 @@
+#!/bin/bash
+# What runs when MOLES.app is opened: starts the launcher on the app's own
+# copy of Python. Paths are relative to the app, so it can be moved freely.
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+PYTHON="$RES/runtime/bin/python3"
+
+if [ ! -x "$PYTHON" ]; then
+    /usr/bin/osascript -e 'display alert "MOLES is not fully installed" message "Its setup did not finish, usually because the internet connection dropped during installation. Run the MOLES installer again." as critical'
+    exit 1
+fi
+
+# Start in the home folder rather than / (where apps opened from Finder start).
+cd "$HOME" || true
+exec "$PYTHON" -m moles

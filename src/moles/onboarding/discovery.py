@@ -9,12 +9,15 @@ commands are issued at any point, so probing an unrelated device on the same
 machine cannot change its state.
 """
 
+import struct
 import time
 from dataclasses import dataclass
 from typing import List, Optional
 
 import serial
 from serial.tools import list_ports
+
+from . import firmware
 
 
 # STM32G473 USB CDC firmware ships with ST's vendor ID. PID 0x5740 is the
@@ -28,6 +31,7 @@ ST_CDC_PRODUCT_ID = 0x5740
 _DEFAULT_DEVICE_ID = 1
 _CMD_READ_GAIN = 16
 _CMD_READ_SWITCH = 17
+_CMD_READ_DIAGNOSTICS = 19
 _VALID_GAIN_BYTES = frozenset({0, 1, 2, 3, 4})
 _VALID_SWITCH_BYTES = frozenset({0, 1})
 
@@ -38,6 +42,10 @@ _PROBE_TIMEOUT_S = 0.5
 # Delay after opening the port before the first command, matching the wait
 # the driver uses on connect to let the STM32 USB UART stack come up.
 _UART_INIT_DELAY_S = 1.0
+# Every firmware with the diagnostics query sends at least its first four
+# counters; newer ones follow with more, which arrive well within this wait.
+_DIAGNOSTICS_MIN_BYTES = 16
+_DIAGNOSTICS_REST_TIMEOUT_S = 0.2
 
 
 @dataclass
@@ -74,22 +82,8 @@ def probe_port(port_path: str) -> Optional[str]:
     length, out-of-range value — returns ``None`` and leaves the port closed.
     No write/switch/DAC commands are ever sent.
     """
-    ser = None
-    try:
-        # ``dsrdtr=False`` prevents pyserial from toggling DTR on open, which
-        # would reset Arduinos and other DTR-sensitive boards that happen to
-        # be plugged into the same machine during a scan.
-        # ``exclusive=True`` makes this open fail on a port another MOLES app
-        # is using, so a scan can never inject probe commands into the middle
-        # of a running experiment's command stream.
-        ser = serial.Serial(
-            port_path,
-            baudrate=_BAUD,
-            timeout=_PROBE_TIMEOUT_S,
-            dsrdtr=False,
-            exclusive=True,
-        )
-    except (serial.SerialException, OSError):
+    ser = _open_for_probe(port_path)
+    if ser is None:
         return None
 
     try:
@@ -110,6 +104,69 @@ def probe_port(port_path: str) -> Optional[str]:
             ser.close()
         except Exception:
             pass
+
+
+def probe_firmware(port_path: str) -> Optional[str]:
+    """Ask the board on one port which firmware release it runs.
+
+    Read-only, like ``probe_port``: the board is identified the same way and
+    then asked for its diagnostics report, whose shape names the release
+    (see ``firmware.version_from_diagnostics``). Returns the version, or None
+    when the port cannot be opened, is not a MOLES potentiostat, or answers
+    with a garbled report.
+    """
+    ser = _open_for_probe(port_path)
+    if ser is None:
+        return None
+
+    try:
+        time.sleep(_UART_INIT_DELAY_S)
+
+        if not _send_and_validate(ser, _CMD_READ_SWITCH, _VALID_SWITCH_BYTES):
+            return None
+
+        ser.reset_input_buffer()
+        ser.write(bytes([_DEFAULT_DEVICE_ID, _CMD_READ_DIAGNOSTICS]))
+        head = ser.read(_DIAGNOSTICS_MIN_BYTES)
+        if not head:
+            # A board that answers the identification commands but ignores
+            # this one predates the query
+            return firmware.version_from_diagnostics(None)
+        if len(head) < _DIAGNOSTICS_MIN_BYTES:
+            return None
+        ser.timeout = _DIAGNOSTICS_REST_TIMEOUT_S
+        rest = ser.read(4 * (len(firmware.DIAGNOSTIC_FIELDS) - 4))
+        raw = head + rest[:len(rest) - len(rest) % 4]
+        values = struct.unpack(f"<{len(raw) // 4}I", raw)
+        return firmware.version_from_diagnostics(
+            dict(zip(firmware.DIAGNOSTIC_FIELDS, values)))
+    except (serial.SerialException, OSError):
+        return None
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def _open_for_probe(port_path: str):
+    """Open a port for read-only probing, or return None if it can't be."""
+    try:
+        # ``dsrdtr=False`` prevents pyserial from toggling DTR on open, which
+        # would reset Arduinos and other DTR-sensitive boards that happen to
+        # be plugged into the same machine during a scan.
+        # ``exclusive=True`` makes this open fail on a port another MOLES app
+        # is using, so a scan can never inject probe commands into the middle
+        # of a running experiment's command stream.
+        return serial.Serial(
+            port_path,
+            baudrate=_BAUD,
+            timeout=_PROBE_TIMEOUT_S,
+            dsrdtr=False,
+            exclusive=True,
+        )
+    except (serial.SerialException, OSError):
+        return None
 
 
 def _send_and_validate(ser, cmd_byte: int, valid_bytes) -> bool:

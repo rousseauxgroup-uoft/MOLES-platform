@@ -11,21 +11,28 @@
 #define TIA_SW_PORT 	GPIOB
 #define TIA_SW_SHIFT	9
 #define TIA_SW_MASK	 	(0xf << TIA_SW_SHIFT)
-#define SW_GAIN_1K		(0x07 << TIA_SW_SHIFT)
-#define SW_GAIN_10K		(0x0b << TIA_SW_SHIFT)
-#define SW_GAIN_100K	(0x0d << TIA_SW_SHIFT)
-#define SW_GAIN_1M		(0x0e << TIA_SW_SHIFT)
-#define SW_GAIN_10M		(0x0f << TIA_SW_SHIFT)
 
-/* Gain for trans-impedance amplifier is 10M fixed resistor
- * in parallel with switched resistors : 1K, 10K, 100K, 1M */
+/* Current ranges. Pins PB9-PB12 (switch code bits 0-3) drive the four
+ * channels of the TMUX6212, which put R10-R13 (100R, 1k, 10k, 100k on the
+ * built boards) across the transimpedance amplifier; R14 (1M) is always
+ * across it. The TMUX6212 turns a channel ON when its pin is HIGH. The
+ * table before firmware 1.4 was written for a switch that turns on when LOW,
+ * so ranges 1-4 landed on ~94, ~103, ~903 and ~93 ohm (bench-measured).
+ * Range 0 keeps its historical code, R10-R12 together: every board's current
+ * calibration and every saved measurement was made on it. */
+#define SW_GAIN_93R		(0x07 << TIA_SW_SHIFT)	// R10 + R11 + R12
+#define SW_GAIN_1K		(0x02 << TIA_SW_SHIFT)	// R11
+#define SW_GAIN_10K		(0x04 << TIA_SW_SHIFT)	// R12
+#define SW_GAIN_91K		(0x08 << TIA_SW_SHIFT)	// R13
+#define SW_GAIN_1M		(0x00 << TIA_SW_SHIFT)	// R14 alone
 
-
-#define TIA_GAIN_1K		999.900009
-#define TIA_GAIN_10K	9990.00999
-#define TIA_GAIN_100K	99009.90099
-#define TIA_GAIN_1M		909090.9091
-#define TIA_GAIN_10M	1e7
+/* Nominal feedback resistance of each range in ohms, with R14 in parallel
+ * and ~4 ohm of switch resistance; the host calibrates each range */
+#define TIA_GAIN_93R	93.4
+#define TIA_GAIN_1K		1003.0
+#define TIA_GAIN_10K	9905.0
+#define TIA_GAIN_91K	90912.0
+#define TIA_GAIN_1M		1e6
 
 #define CONVERT_TIMEOUT	100
 
@@ -191,10 +198,15 @@ void Set_DAC_Value(eDAC_CHANNELS channel, float val);
 float Get_DAC_Value(eDAC_CHANNELS channel);
 void Update_ADC_Readings(uint8_t *channels,uint8_t channel_cnt);
 float Set_TIA_Gain(eTIA_GAIN gain);
+float TIA_Gain_Ohms(eTIA_GAIN gain);
+float Read_WEOUT_Fast(void);
 void Pstat_RunTime(void *argument);
 int32_t CurrentHoldStep();
 uint32_t StepCapture(uint32_t n_samples, uint32_t period_us,
                      uint8_t *out_buf, uint32_t *actual_duration_us);
+uint32_t DacStepCapture(uint32_t n_samples, uint32_t period_us, uint32_t n_pre,
+                        float dac_v, uint8_t *out_buf,
+                        uint32_t *actual_duration_us, uint32_t *centre_ns);
 
 const extern st_DAC_Chn dac_ch_cfg[];
 

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Runs before the new MOLES.app is copied in. Removes the previous version
+# entirely: the installer only adds and replaces files, so leftovers (an old
+# MOLES wheel, the old Python) would otherwise mix with the new version.
+# $2 is where the package installs to (/Applications).
+set -euo pipefail
+old="$2/MOLES.app"
+if [ -n "$2" ] && [ -d "$old" ]; then
+    rm -rf "$old"
+fi
+exit 0

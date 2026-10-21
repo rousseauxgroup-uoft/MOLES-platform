@@ -3,6 +3,8 @@
 Subpackages:
   - ``electrolysis``: multichannel electrosynthesis control UI.
   - ``electroanalysis``: tabbed CV / DPV control and analysis UI.
+  - ``data_analysis``: workspace of copied data files and plot windows for
+    comparing and labelling saved voltammograms.
   - ``plots``: post-experiment data viewers (CSV in, plot out).
 """
 

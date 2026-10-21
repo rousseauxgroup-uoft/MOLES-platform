@@ -6,11 +6,17 @@ is a ``QRunnable`` that runs one experiment in a background thread and emits
 PyQt signals as data arrives, so the UI thread can update plots/labels live.
 
 ``ReconnectWorker`` does the same for the slower disconnect/reconnect cycle
-that recovers a serial port from a stuck state.
+that recovers a serial port from a stuck state, and ``DatasetLoadWorker`` for
+reading a finished run's CSV back off disk.
+
+Anything here that can block belongs off the GUI thread: while the event loop
+is stuck, the Stop button, the hung-worker watchdog and the window's own close
+handler are all unavailable, because each of them is a GUI-thread slot.
 """
 
 import csv
 import logging
+import os
 import threading
 import time
 
@@ -140,6 +146,10 @@ class ElectrolysisWorker(QtCore.QRunnable):
         self.claim_key = claim_key
         self.port = port
         self.stop_event = threading.Event()
+        # Set when the run is abandoned before it ever began. A worker can sit
+        # in the pool queue indefinitely, and without this it would start an
+        # unattended experiment from stale parameters whenever a thread frees up.
+        self.cancel_event = threading.Event()
         # Mediates live edits between the GUI thread and the running method loop.
         self.control = LiveControl()
         self._params_lock = threading.Lock()
@@ -147,6 +157,11 @@ class ElectrolysisWorker(QtCore.QRunnable):
         self.setAutoDelete(True)
 
     def stop(self):
+        self.stop_event.set()
+
+    def cancel(self):
+        """Abandon this run: it will do nothing even if the pool starts it later."""
+        self.cancel_event.set()
         self.stop_event.set()
 
     def apply_live(self, new_params):
@@ -173,6 +188,12 @@ class ElectrolysisWorker(QtCore.QRunnable):
         self.control.request_switch()
 
     def run(self):
+        # Checked before anything touches hardware: by the time a queued worker
+        # gets a thread, the GUI may have long since given up on it.
+        if self.cancel_event.is_set():
+            logger.info("[PS %s] Start cancelled before the worker ran", self.pot_id)
+            return
+
         output_queue = SignalQueue(self.data_buffer)
 
         # Refuse to touch a board another app is using — and tell the user who.
@@ -297,6 +318,42 @@ class ElectrolysisWorker(QtCore.QRunnable):
             # Only after the port is closed is the board safe for another app.
             if self.claim_key is not None:
                 claims.release(self.claim_key)
+
+
+class DatasetLoadSignals(QtCore.QObject):
+    """Signals emitted by ``DatasetLoadWorker``."""
+    loaded = QtCore.pyqtSignal(str, object)   # path, (time_s, charge_c, metrics, method, mmol)
+    failed = QtCore.pyqtSignal(str, str)      # path, error message
+
+
+class DatasetLoadWorker(QtCore.QRunnable):
+    """Read a finished run's CSV in a background thread.
+
+    Parsing a completed run used to happen in the GUI thread the moment the
+    experiment ended. A multi-hour run is tens of thousands of rows, and the
+    data folder is typically cloud-synced, where even ``os.path.exists`` can
+    block for a long time — either one freezes every other running channel's
+    display. Only the parsed arrays cross back to the GUI thread.
+    """
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = str(path)
+        self.signals = DatasetLoadSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        # Imported here so the GUI's worker module doesn't pull in pandas at
+        # startup just to have this class available.
+        from .visualization_tab import load_electrolysis
+
+        try:
+            if not os.path.exists(self.path):
+                self.signals.failed.emit(self.path, "file not found")
+                return
+            self.signals.loaded.emit(self.path, load_electrolysis(self.path))
+        except Exception as e:
+            self.signals.failed.emit(self.path, str(e))
 
 
 class ReconnectSignals(QtCore.QObject):

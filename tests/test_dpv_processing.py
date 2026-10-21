@@ -99,13 +99,31 @@ def test_cyclic_sweeps_negative_initial_direction():
 
 def test_cyclic_sweeps_start_and_end_lead_in_out():
     # Start V and End V add a lead-in and lead-out, CV-style: begin at Start V,
-    # cycle between the vertices, finish at End V.
+    # visit both vertices, then leave the second vertex for End V.
     assert cyclic_sweeps(-0.5, 1.0, 1, start_V=0.0, end_V=0.2) == [
-        (0.0, 1.0), (1.0, -0.5), (-0.5, 1.0), (1.0, 0.2)]
+        (0.0, 1.0), (1.0, -0.5), (-0.5, 0.2)]
     # A lead-in that already sits at the first vertex is dropped, not emitted
     # as a zero-length leg.
     assert cyclic_sweeps(-0.5, 1.0, 1, start_V=1.0, end_V=1.0) == [
         (1.0, -0.5), (-0.5, 1.0)]
+
+
+def test_cyclic_sweeps_start_on_second_vertex_counts_cycles_exactly():
+    # Regression: Start = End = Max with a Negative first sweep used to run
+    # 0 -> -2 -> 0 -> -2 -> 0 for one cycle (lead-in + lead-out formed an
+    # uncounted extra cycle). Either direction must now give one round trip.
+    for direction in ('Negative', 'Positive'):
+        assert cyclic_sweeps(-2.0, 0.0, 1, direction=direction,
+                             start_V=0.0, end_V=0.0) == [(0.0, -2.0), (-2.0, 0.0)]
+    assert cyclic_sweeps(-2.0, 0.0, 2, direction='Negative',
+                         start_V=0.0, end_V=0.0) == [
+        (0.0, -2.0), (-2.0, 0.0), (0.0, -2.0), (-2.0, 0.0)]
+
+
+def test_cyclic_sweeps_mid_window_start_returns_to_start():
+    assert cyclic_sweeps(-2.0, 0.0, 1, direction='Negative',
+                         start_V=-1.0, end_V=-1.0) == [
+        (-1.0, -2.0), (-2.0, 0.0), (0.0, -1.0)]
 
 
 def test_build_dpv_waveform_single_roundtrip():

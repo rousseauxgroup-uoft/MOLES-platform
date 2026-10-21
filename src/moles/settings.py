@@ -10,6 +10,7 @@ Currently exposed:
   - ``cv_data_folder``: where CV / DPV CSV files are written.
   - ``show_electrolysis_plot_after_run``: whether the post-run plotter window
     is launched automatically when an electrolysis experiment finishes.
+  - ``skipped_update_version``: a release the launcher should stop offering.
 """
 
 import json
@@ -105,4 +106,16 @@ def set_show_electrolysis_plot_after_run(value: bool) -> None:
     """Persist the post-run plot toggle."""
     data = _load_raw()
     data["show_electrolysis_plot_after_run"] = bool(value)
+    _save_raw(data)
+
+
+def get_skipped_update_version() -> str:
+    """The release the user chose "Skip This Version" for, or "" if none."""
+    raw = _load_raw().get("skipped_update_version")
+    return raw if isinstance(raw, str) else ""
+
+
+def set_skipped_update_version(version: str) -> None:
+    data = _load_raw()
+    data["skipped_update_version"] = str(version)
     _save_raw(data)
