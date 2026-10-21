@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moles"
-version = "0.1.1"
-description = "MOLES — Modular Open-source Laboratory for Electrochemistry Screening."
+version = "1.0.0"
+description = "MOLES — Modular Open-source Laboratory for Electrosynthesis Screening."
 authors = [
     { name = "Benjamin Chiu" },
 ]
