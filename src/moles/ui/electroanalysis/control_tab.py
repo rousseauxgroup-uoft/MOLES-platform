@@ -22,43 +22,14 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
 from ...calibration import get_potentiostat_ports
-from ...driver.ps4_ref import HW_VOLTAGE_COMPLIANCE_V, VOLTAGE_WARN_THRESHOLD_V
+from ...driver.ps4_ref import HW_VOLTAGE_COMPLIANCE_V
 from ...methods.dpv import process_dpv
 from ...settings import get_cv_data_folder
 from ..scrollable_plots import PlotScrollArea, apply_scroll_height
 from .widgets import PotentiostatPanel
-from .workers import DPV_SAMPLE_HZ, RuWorker, VoltammetryWorker
+from .workers import (DPV_SAMPLE_HZ, RuWorker, VoltammetryWorker,
+                      potentials_beyond_compliance as _potentials_beyond_compliance)
 
-
-def _potentials_beyond_compliance(params):
-    """Return the requested potentials this run cannot physically reach.
-
-    Collects the extreme potentials the waveform will ask for (for DPV the
-    pulse rides on top of the staircase in the scan direction, so the pulsed
-    points sit beyond the plain sweep limits) and returns those beyond the
-    warning threshold.
-    """
-    if params.get('method') == 'OCP':
-        return []  # nothing is driven: the cell stays disconnected throughout
-    if params.get('method') == 'DPV':
-        pulse = abs(params.get('pulse_V', 0.0))
-        if params.get('dpv_type') == 'cyclic':
-            lo = params.get('min_V', 0.0)
-            hi = params.get('max_V', 0.0)
-            # Pulses push past the window: up at the top, down at the bottom.
-            # Start/End V can sit outside the vertices, so include them too.
-            extremes = [lo, hi, hi + pulse, lo - pulse,
-                        params.get('start_V', 0.0), params.get('end_V', 0.0)]
-        else:
-            start = params.get('start_V', 0.0)
-            end = params.get('end_V', 0.0)
-            # The pulse rides in the scan direction, so the far end is pushed
-            # further out than End V itself.
-            direction = 1.0 if end >= start else -1.0
-            extremes = [start, end, end + direction * pulse]
-    else:
-        extremes = [params.get(k, 0.0) for k in ('start_V', 'min_V', 'max_V', 'last_V')]
-    return sorted({v for v in extremes if abs(v) > VOLTAGE_WARN_THRESHOLD_V})
 
 # Per-channel trace colours, one per potentiostat slot A–H.
 _CHANNEL_COLORS = {
@@ -309,7 +280,10 @@ class ControlTab(QtWidgets.QWidget):
         # Warn before starting a sweep the hardware cannot deliver: beyond the
         # output compliance the recorded potential flattens while the software
         # keeps scanning, which silently corrupts that segment of the data.
-        offenders = _potentials_beyond_compliance(params)
+        # Potentials entered vs OCP are only known once the worker measures
+        # it, so the worker checks those itself.
+        offenders = ([] if params.get('vs_ocp')
+                     else _potentials_beyond_compliance(params))
         if offenders:
             listed = ", ".join(f"{v:+.2f} V" for v in offenders)
             reply = QtWidgets.QMessageBox.warning(

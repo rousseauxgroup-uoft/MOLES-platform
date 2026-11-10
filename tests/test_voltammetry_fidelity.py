@@ -382,3 +382,124 @@ def test_cv_form_states_the_real_step_and_warns_when_coarse(window):
     assert "2.4 mV levels" in cfg.scan_note.text()
     cfg.scan_rate.setValue(2000.0)
     assert "coarse" in cfg.scan_note.text()
+
+
+# ----------------------------------------------------------------------
+# Potentials entered relative to the open-circuit potential
+# ----------------------------------------------------------------------
+
+def _params_file(out):
+    """The params file of a run, as a dict of its text values."""
+    text = Path(out['fp']).with_suffix('.params.txt').read_text()
+    return dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+
+
+def _attempt(tab, pid='A'):
+    """Run a worker and return what it reported, success or not."""
+    from moles.ui.electroanalysis.workers import VoltammetryWorker
+    worker = VoltammetryWorker(pid, "MOCK_" + pid, tab._panels[pid].get_params(),
+                               use_mock=True)
+    captured = {}
+    worker.signals.finished.connect(
+        lambda p, s, m, r, fp: captured.update(success=s, msg=m))
+    worker.run()
+    return captured
+
+
+def test_reference_to_ocp_shifts_potentials_and_keeps_the_entered_values():
+    from moles.ui.electroanalysis.workers import reference_to_ocp
+    params = {'start_V': 0.0, 'min_V': -0.5, 'max_V': 1.0, 'last_V': 0.0,
+              'pulse_V': 0.05, 'mV_s': 100.0}
+    reference_to_ocp(params, 0.1234)
+    assert (params['start_V'], params['min_V'], params['max_V'], params['last_V']) \
+        == (0.1234, -0.3766, 1.1234, 0.1234)
+    assert params['min_V_vs_ocp'] == -0.5
+    # Heights and rates are differences, not potentials
+    assert params['pulse_V'] == 0.05 and params['mV_s'] == 100.0
+
+
+def test_unticked_cv_drives_the_potentials_as_entered(window, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+    seen = {}
+
+    class _Spy(MockLivePotentiostat):
+        def perform_CV(self, *args, **kwargs):
+            seen.update(kwargs)
+            return super().perform_CV(*args, **kwargs)
+    monkeypatch.setattr(workers, "MockLivePotentiostat", _Spy)
+    cfg = window.cv_tab._panels['A'].config
+    cfg.start_v.setValue(0.1)
+    out = _run_worker(window.cv_tab)
+    assert seen['start_V'] == 0.1 and seen['min_V'] == -0.5
+    assert _params_file(out)['vs_ocp'] == 'False'
+
+
+def test_cv_vs_ocp_drives_potentials_offset_by_the_measured_ocp(window, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+    seen = {}
+
+    class _Spy(MockLivePotentiostat):
+        def perform_CV(self, *args, **kwargs):
+            seen.update(kwargs)
+            return super().perform_CV(*args, **kwargs)
+    monkeypatch.setattr(workers, "MockLivePotentiostat", _Spy)
+    cfg = window.cv_tab._panels['A'].config
+    cfg.vs_ocp.setChecked(True)
+    assert cfg.start_v.suffix() == " vs OCP"
+    out = _run_worker(window.cv_tab)
+
+    params = _params_file(out)
+    ocp = float(params['ocp_V'])
+    assert ocp != 0.0
+    assert seen['start_V'] == pytest.approx(0.0 + ocp)
+    assert seen['min_V'] == pytest.approx(-0.5 + ocp)
+    assert seen['max_V'] == pytest.approx(1.0 + ocp)
+    assert seen['last_V'] == pytest.approx(0.0 + ocp)
+    assert params['vs_ocp'] == 'True'
+    assert params['start_V_vs_ocp'] == '0.0'
+    assert float(params['start_V']) == pytest.approx(ocp)
+
+
+def test_dpv_vs_ocp_starts_the_waveform_at_the_ocp(window):
+    cfg = window.dpv_tab._panels['A'].config
+    cfg.vs_ocp.setChecked(True)
+    out = _run_worker(window.dpv_tab)
+    params = _params_file(out)
+    ocp = float(params['ocp_V'])
+    assert float(params['end_V']) == pytest.approx(1.0 + ocp)
+    diff_path = Path(out['fp'])
+    raw = np.loadtxt(diff_path.with_name(diff_path.stem + "_RAW.csv"),
+                     delimiter=",", skiprows=1)
+    # Target V of the first point, within one DAC level of grid snapping
+    assert raw[0, 3] == pytest.approx(ocp, abs=2 * NOMINAL_DAC_STEP_V)
+
+
+def test_vs_ocp_run_beyond_the_output_limit_is_refused_before_driving(window, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+    called = []
+
+    class _Spy(MockLivePotentiostat):
+        def perform_CV(self, *args, **kwargs):
+            called.append(True)
+            return super().perform_CV(*args, **kwargs)
+    monkeypatch.setattr(workers, "MockLivePotentiostat", _Spy)
+    cfg = window.cv_tab._panels['A'].config
+    cfg.vs_ocp.setChecked(True)
+    cfg.max_v.setValue(4.5)          # the mock cell rests above 0 V
+    out = _attempt(window.cv_tab)
+    assert out['success'] is False
+    assert "beyond what the potentiostat can drive" in out['msg']
+    assert not called
+
+
+def test_vs_ocp_run_is_refused_when_the_ocp_cannot_be_read(window, monkeypatch):
+    import moles.ui.electroanalysis.workers as workers
+
+    class _NoOcp(MockLivePotentiostat):
+        def read_ocp(self, restore_switch_state=True):
+            raise TimeoutError("no reply")
+    monkeypatch.setattr(workers, "MockLivePotentiostat", _NoOcp)
+    window.cv_tab._panels['A'].config.vs_ocp.setChecked(True)
+    out = _attempt(window.cv_tab)
+    assert out['success'] is False
+    assert "open-circuit potential" in out['msg']

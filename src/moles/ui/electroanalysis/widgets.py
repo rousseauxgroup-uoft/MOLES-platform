@@ -51,6 +51,25 @@ def _quiet_time_spin():
     return spin
 
 
+def _vs_ocp_checkbox(spins):
+    """The 'vs OCP' choice shared by the CV and DPV forms. When ticked, the
+    potentials in ``spins`` are offsets from the open-circuit potential the run
+    measures just before it starts, and each box says so."""
+    box = QtWidgets.QCheckBox("Potentials vs OCP")
+    box.setToolTip(
+        "Ticked: every potential below is relative to the open-circuit\n"
+        "potential, measured just before the run (0 V = start at rest).\n"
+        "Unticked: potentials are vs the reference electrode.\n"
+        "Either way the saved potentials are vs the reference electrode;\n"
+        "the measured OCP is recorded in the params file.")
+
+    def _relabel(checked):
+        for spin in spins:
+            spin.setSuffix(" vs OCP" if checked else "")
+    box.toggled.connect(_relabel)
+    return box
+
+
 class CVConfigWidget(QtWidgets.QWidget):
     """Form for entering cyclic voltammetry parameters."""
 
@@ -92,6 +111,10 @@ class CVConfigWidget(QtWidgets.QWidget):
             "Negative: Start → Min\nPositive: Start → Max"
         )
         layout.addRow("Direction:", self.direction_combo)
+
+        self.vs_ocp = _vs_ocp_checkbox(
+            (self.start_v, self.min_v, self.max_v, self.last_v))
+        layout.addRow("", self.vs_ocp)
 
         self.cycles = QtWidgets.QSpinBox()
         self.cycles.setRange(1, 100)
@@ -266,6 +289,7 @@ class CVConfigWidget(QtWidgets.QWidget):
             'min_V': self.min_v.value(),
             'max_V': self.max_v.value(),
             'last_V': self.last_v.value(),
+            'vs_ocp': self.vs_ocp.isChecked(),
             'scan_direction': self.direction_combo.currentText(),
             'cycles': self.cycles.value(),
             'mV_s': self.scan_rate.value(),
@@ -532,6 +556,11 @@ class DPVConfigWidget(QtWidgets.QWidget):
         cyclic_form.addRow("Cycles:", self.cycles)
         layout.addRow(self.cyclic_box)
 
+        self.vs_ocp = _vs_ocp_checkbox(
+            (self.start_v, self.end_v, self.cyc_start_v, self.min_v,
+             self.max_v, self.cyc_end_v))
+        layout.addRow("", self.vs_ocp)
+
         self.pulse_v = QtWidgets.QDoubleSpinBox()
         self.pulse_v.setRange(0, 1.0)
         self.pulse_v.setSingleStep(0.01)
@@ -659,6 +688,7 @@ class DPVConfigWidget(QtWidgets.QWidget):
             'p_hold': self.step_width.value(),
             'quiet_time_s': self.quiet_time.value(),
             'current_range': self.current_range.currentData(),
+            'vs_ocp': self.vs_ocp.isChecked(),
         }
         if self.type_combo.currentText() == "Cyclic":
             params.update({
