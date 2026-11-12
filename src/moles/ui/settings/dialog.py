@@ -12,6 +12,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtWidgets
 
 from ..visual_identity import apply_app_icon
+from ..wheel_guard import install_wheel_guard
 
 # moles/ui/__init__.py runs automatically when this subpackage is imported,
 # applying the macOS Qt plugin fix before QApplication is created.
@@ -51,7 +52,7 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         self.cv_folder_edit = self._add_folder_row(
             layout,
-            label="Folder for CV / DPV data:",
+            label="Folder for electroanalysis (CV / DPV / OCP) data:",
             placeholder=DEFAULT_CV_DATA_FOLDER,
         )
 
@@ -151,6 +152,7 @@ class SettingsDialog(QtWidgets.QDialog):
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app)
+    install_wheel_guard(app)
     dlg = SettingsDialog()
     dlg.exec_()
     app.quit()

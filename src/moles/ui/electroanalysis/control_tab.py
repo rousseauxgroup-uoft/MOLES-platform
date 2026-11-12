@@ -257,8 +257,10 @@ class ControlTab(QtWidgets.QWidget):
         pen_raw, pen_smooth = self._make_pens(pid)
         raw = p.plot([], [], pen=pen_raw, name="Raw")
         smooth = p.plot([], [], pen=pen_smooth, name="Smoothed")
+        marker = self._make_marker(p, pid)
 
-        self._plots[pid] = {'plot': p, 'raw': raw, 'smooth': smooth}
+        self._plots[pid] = {'plot': p, 'raw': raw, 'smooth': smooth,
+                            'marker': marker}
         self._ylabels[pid] = (ytext, yunits)
         self._xlabels[pid] = (xtext, xunits)
         self._dpv_view[pid] = 'differential'
@@ -270,6 +272,17 @@ class ControlTab(QtWidgets.QWidget):
         pen_raw = pg.mkPen(color=color, width=1, style=QtCore.Qt.DotLine)
         pen_smooth = pg.mkPen(color=color, width=2)
         return pen_raw, pen_smooth
+
+    @staticmethod
+    def _make_marker(plot_item, pid):
+        """Add the round marker that shows the newest point of a running
+        experiment. It has no name, so it stays out of the legend."""
+        color = _CHANNEL_COLORS.get(pid, 'b')
+        marker = plot_item.plot(
+            [], [], pen=None, symbol='o', symbolSize=15,
+            symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen('k', width=2.5))
+        marker.setZValue(10)
+        return marker
 
     # ------------------------------------------------------------------
     # Experiment lifecycle
@@ -315,6 +328,7 @@ class ControlTab(QtWidgets.QWidget):
         if pot_id in self._plots:
             self._set_curve(pot_id, 'raw', [], [])
             self._set_curve(pot_id, 'smooth', [], [])
+            self._set_curve(pot_id, 'marker', [], [])
             # Point the axes at whatever this run will plot (a prior run may have
             # relabelled them, and DPV depends on the selected live view).
             if self.method == 'DPV':
@@ -479,6 +493,10 @@ class ControlTab(QtWidgets.QWidget):
         untouched and saved at full resolution). The smoothing window is scaled
         by the same factor so the smoothed trace still averages over the same
         span of the sweep.
+
+        While the channel's experiment is running, a round marker sits on the
+        newest point (taken from the full data, so thinning never hides it),
+        showing where the potentiostat is even when sweeps overlap.
         """
         v = np.asarray(v, dtype=float)
         i = np.asarray(i, dtype=float)
@@ -487,6 +505,10 @@ class ControlTab(QtWidgets.QWidget):
         window_r = max(1, int(round(window / stride)))
         self._set_curve(pid, 'raw', v_r, i_r)
         self._apply_smoothing(pid, v_r, i_r, window_r)
+        if pid in self._active_workers and v.size and i.size:
+            self._set_curve(pid, 'marker', v[-1:], i[-1:])
+        else:
+            self._set_curve(pid, 'marker', [], [])
 
     def update_smoothing(self, pot_id, window):
         """Re-apply smoothing when the user changes the smoothing spinbox."""
@@ -532,7 +554,7 @@ class ControlTab(QtWidgets.QWidget):
             self._set_curve(pot_id, 'smooth', v_data, i_data)
 
     def _set_curve(self, pid, which, x, y):
-        """Update one trace ('raw' or 'smooth') on the grid plot and, if the
+        """Update one trace ('raw', 'smooth' or 'marker') on the grid plot and, if the
         channel is also showing in a pop-out window, on that copy too."""
         self._plots[pid][which].setData(x, y)
         po = self._popouts.get(pid)
@@ -617,10 +639,12 @@ class ControlTab(QtWidgets.QWidget):
         pen_raw, pen_smooth = self._make_pens(pid)
         raw = p.plot([], [], pen=pen_raw, name="Raw")
         smooth = p.plot([], [], pen=pen_smooth, name="Smoothed")
+        marker = self._make_marker(p, pid)
         win._vbox.addWidget(plot_w)
 
         # Register before seeding so the helpers below also fill the new window.
-        self._popouts[pid] = {'win': win, 'plot': p, 'raw': raw, 'smooth': smooth}
+        self._popouts[pid] = {'win': win, 'plot': p, 'raw': raw, 'smooth': smooth,
+                              'marker': marker}
         win.closed.connect(lambda: self._close_channel_popout(pid))
 
         data = self._live_data.get(pid, self._empty_live_data())
@@ -651,6 +675,10 @@ class ControlTab(QtWidgets.QWidget):
     def _on_finished(self, pot_id, success, msg, result, filepath):
         """Handle worker completion: finalize the plot and announce the save."""
         self._active_workers.pop(pot_id, None)
+        # The run is over, so the newest-point marker goes (the final repaint
+        # below would also drop it, but stopped and failed runs skip that).
+        if pot_id in self._plots:
+            self._set_curve(pot_id, 'marker', [], [])
         # Every outcome is a final state, so the panel re-enables Run
         if not (success or msg == "Stopped" or msg.startswith("Error")):
             msg = f"Error: {msg}"

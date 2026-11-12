@@ -149,7 +149,7 @@ def test_worker_end_to_end():
     from moles.ui.electrolysis.workers import ElectrolysisWorker
 
     tmp = Path(tempfile.mkdtemp())
-    data_io.DATA_FOLDER = tmp  # keep smoke-test CSVs out of Dropbox
+    data_io.DATA_FOLDER = tmp  # keep smoke-test CSVs out of the user's data folder
 
     results = []
 

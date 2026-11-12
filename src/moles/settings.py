@@ -7,7 +7,7 @@ next save without needing to restart any running UI.
 
 Currently exposed:
   - ``data_folder``: where electrolysis CSV files are written.
-  - ``cv_data_folder``: where CV / DPV CSV files are written.
+  - ``cv_data_folder``: where CV / DPV / OCP CSV files are written.
   - ``show_electrolysis_plot_after_run``: whether the post-run plotter window
     is launched automatically when an electrolysis experiment finishes.
   - ``skipped_update_version``: a release the launcher should stop offering.
@@ -22,10 +22,20 @@ from typing import Any, Dict
 # registry so all user-side state for MOLES lives in one place.
 SETTINGS_PATH = Path.home() / ".moles" / "settings.json"
 
-# Default folders for each experiment type. Match the original hardcoded
-# values so existing users see no change until they pick a different folder.
-DEFAULT_DATA_FOLDER = Path.home() / "Dropbox" / "EChem Results"
-DEFAULT_CV_DATA_FOLDER = Path.home() / "Dropbox" / "CV Results"
+# Data folders: one parent folder holding one subfolder per app. The user
+# picks the parent the first time the launcher opens (see
+# moles.ui.settings.data_folder_prompt); the defaults below are only used
+# until then, e.g. if an app is started before the prompt was answered.
+DEFAULT_PARENT_FOLDER = Path.home() / "Documents" / "MOLES Data"
+ELECTROLYSIS_SUBFOLDER = "Electrolysis Data"
+ELECTROANALYSIS_SUBFOLDER = "Electroanalysis Data"
+DEFAULT_DATA_FOLDER = DEFAULT_PARENT_FOLDER / ELECTROLYSIS_SUBFOLDER
+DEFAULT_CV_DATA_FOLDER = DEFAULT_PARENT_FOLDER / ELECTROANALYSIS_SUBFOLDER
+
+# Where MOLES 1.0 and earlier saved data when no folder was set. Only used to
+# offer existing users the choice of continuing to save there.
+LEGACY_DATA_FOLDER = Path.home() / "Dropbox" / "EChem Results"
+LEGACY_CV_DATA_FOLDER = Path.home() / "Dropbox" / "CV Results"
 
 # Default behaviour: pop the electrolysis plot window when a run ends.
 DEFAULT_SHOW_PLOT = True
@@ -92,6 +102,27 @@ def get_cv_data_folder() -> Path:
 
 def set_cv_data_folder(folder: Path) -> None:
     _write_folder("cv_data_folder", folder)
+
+
+def data_folders_configured() -> bool:
+    """True once both data folders have been saved to the settings file."""
+    raw = _load_raw()
+    return all(isinstance(raw.get(k), str) and raw[k].strip()
+               for k in ("data_folder", "cv_data_folder"))
+
+
+def set_data_folders_from_parent(parent: Path) -> None:
+    """Save both data folders as the standard subfolders of ``parent``."""
+    parent = Path(parent).expanduser()
+    data = _load_raw()
+    data["data_folder"] = str(parent / ELECTROLYSIS_SUBFOLDER)
+    data["cv_data_folder"] = str(parent / ELECTROANALYSIS_SUBFOLDER)
+    _save_raw(data)
+
+
+def legacy_data_folders_exist() -> bool:
+    """True if either old default Dropbox folder exists on this computer."""
+    return LEGACY_DATA_FOLDER.is_dir() or LEGACY_CV_DATA_FOLDER.is_dir()
 
 
 def get_show_electrolysis_plot_after_run() -> bool:

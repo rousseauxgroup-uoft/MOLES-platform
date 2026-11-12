@@ -18,6 +18,7 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..visual_identity import apply_app_icon
+from ..wheel_guard import install_wheel_guard
 from ...calibration import load_calibrations  # legacy bundled loader for first-run seed
 from ...driver.mock import MockPotentiostat
 from ...driver.ps4_ref import Potentiostat
@@ -714,6 +715,7 @@ def _sort_key(name: str) -> int:
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app)
+    install_wheel_guard(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

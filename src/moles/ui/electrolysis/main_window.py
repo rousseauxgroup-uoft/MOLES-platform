@@ -20,6 +20,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ... import claims
 from ..visual_identity import apply_app_icon
+from ..settings.data_folder_prompt import ensure_data_folders
+from ..wheel_guard import install_wheel_guard
 from ...calibration import POTENTIOSTAT_CALIBRATIONS, get_potentiostat_ports
 from ...data_io import calculate_total_charge
 from ...driver.mock import MockPotentiostat
@@ -2112,11 +2114,16 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app)
+    install_wheel_guard(app)
     pg.setConfigOption('background', 'w')
     pg.setConfigOption('foreground', 'k')
 
     win = MainWindow()
     win.show()
+    # Ask where to save data if no folder is set yet (new install, or an
+    # upgrade from a version that defaulted to Dropbox). Queued so the
+    # prompt opens over the window rather than before it.
+    QtCore.QTimer.singleShot(0, lambda: ensure_data_folders(win))
 
     sys.exit(app.exec_())
 

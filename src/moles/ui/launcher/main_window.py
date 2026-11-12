@@ -28,6 +28,8 @@ from ...onboarding import firmware
 from ...onboarding.discovery import probe_firmware
 from ...onboarding.registry import load_registry
 from ..visual_identity import apply_app_icon, load_logo_pixmap
+from ..settings.data_folder_prompt import ensure_data_folders
+from ..wheel_guard import install_wheel_guard
 from .update_offer import UpdateCheckThread, UpdateOffer
 
 logger = logging.getLogger(__name__)
@@ -467,8 +469,13 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app)
+    install_wheel_guard(app)
     win = LauncherWindow()
     win.show()
+    # Ask where to save data if no folder is set yet (new install, or an
+    # upgrade from a version that defaulted to Dropbox). Queued so the
+    # prompt opens over the window rather than before it.
+    QtCore.QTimer.singleShot(0, lambda: ensure_data_folders(win))
     sys.exit(app.exec_())
 
 
