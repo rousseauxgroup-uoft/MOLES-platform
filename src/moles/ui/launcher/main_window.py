@@ -27,7 +27,7 @@ from ...logging_setup import install_qt_message_handler, setup_logging
 from ...onboarding import firmware
 from ...onboarding.discovery import probe_firmware
 from ...onboarding.registry import load_registry
-from ..visual_identity import apply_app_icon, load_logo_pixmap
+from ..visual_identity import apply_app_icon, load_app_icon_pixmap, load_logo_pixmap
 from ..settings.data_folder_prompt import ensure_data_folders
 from ..wheel_guard import install_wheel_guard
 from .update_offer import UpdateCheckThread, UpdateOffer
@@ -40,11 +40,23 @@ REFRESH_MS = 2000
 # Launchable apps: button label -> python module to spawn.
 APPS = (
     ("Electrolysis", "moles.ui.electrolysis"),
-    ("Electroanalysis (CV / DPV)", "moles.ui.electroanalysis"),
+    ("Electroanalysis", "moles.ui.electroanalysis"),
     ("Data Analysis", "moles.ui.data_analysis"),
     ("Onboarding", "moles.ui.onboarding"),
     ("Settings", "moles.ui.settings"),
 )
+
+# Each app's button shows its icon from visual_identity.APP_ICONS, the same
+# one the app itself shows in the Dock or taskbar.
+
+# Launch buttons: icon size, the blue ring drawn round the icon on hover or
+# keyboard focus, the icon's distance from the tile's top, and the tile's size
+# (icon, label underneath, padding).
+APP_ICON_PX = 96
+APP_ICON_TOP_PX = 8
+APP_RING_PX = 3
+APP_RING_COLOR = "#2f7de1"
+APP_TILE_SIZE = (132, APP_ICON_PX + 56)
 
 COL_NAME, COL_PORT, COL_CAL, COL_FW, COL_STATUS = range(5)
 TABLE_HEADERS = ("Board", "Port", "Calibrated", "Firmware", "Status")
@@ -160,11 +172,109 @@ class FirmwareCheckThread(QtCore.QThread):
         self.checked.emit(results)
 
 
+class AppTile(QtWidgets.QAbstractButton):
+    """A launch button: the app's icon with its name underneath.
+
+    Hovering (or tabbing to it with the keyboard) draws a blue ring that
+    follows the icon's own rounded outline. Focus the window gives a tile when
+    it opens does not count, so no tile starts out ringed. Without its icon (a trimmed install) the tile shows its
+    name alone and still works.
+    """
+
+    def __init__(self, label, icon, parent=None):
+        super().__init__(parent)
+        self.setText(label)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAttribute(QtCore.Qt.WA_Hover)
+        self.setFixedSize(*APP_TILE_SIZE)
+        self.setAccessibleName(f"Open {label}")
+        self._icon = icon
+        self._scaled = {}  # device pixel ratio -> (icon, ring) pixmaps
+        self._tabbed_to = False
+
+    def _pixmaps(self):
+        """The icon and its ring, made once per device pixel ratio so both stay sharp."""
+        dpr = self.devicePixelRatioF()
+        if dpr not in self._scaled:
+            icon = self._icon.scaled(int(APP_ICON_PX * dpr), int(APP_ICON_PX * dpr),
+                                     QtCore.Qt.KeepAspectRatio,
+                                     QtCore.Qt.SmoothTransformation)
+            icon.setDevicePixelRatio(dpr)
+            self._scaled[dpr] = (icon, _ring(icon, APP_RING_PX, QtGui.QColor(APP_RING_COLOR)))
+        return self._scaled[dpr]
+
+    def _highlighted(self):
+        return self.underMouse() or self.isDown() or (self._tabbed_to and self.hasFocus())
+
+    def focusInEvent(self, event):
+        self._tabbed_to = event.reason() in (QtCore.Qt.TabFocusReason,
+                                             QtCore.Qt.BacktabFocusReason)
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        self._tabbed_to = False
+        super().focusOutEvent(event)
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        x, y = (self.width() - APP_ICON_PX) // 2, APP_ICON_TOP_PX
+        if not self._icon.isNull():
+            icon, ring = self._pixmaps()
+            if self._highlighted():
+                p.drawPixmap(x - APP_RING_PX, y - APP_RING_PX, ring)
+            p.drawPixmap(x, y, icon)
+        else:
+            p.setPen(QtGui.QPen(QtGui.QColor(APP_RING_COLOR) if self._highlighted()
+                                else self.palette().color(QtGui.QPalette.Mid), 2))
+            p.drawRoundedRect(QtCore.QRectF(x, y, APP_ICON_PX, APP_ICON_PX), 22, 22)
+        font = self.font()
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() + 0.5)
+        p.setFont(font)
+        p.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        p.drawText(QtCore.QRect(0, y + APP_ICON_PX + 4, self.width(), self.height()),
+                   QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop, self.text())
+
+    def event(self, event):
+        # Repaint when the mouse comes and goes, so the ring follows it.
+        if event.type() in (QtCore.QEvent.HoverEnter, QtCore.QEvent.HoverLeave):
+            self.update()
+        return super().event(event)
+
+    def sizeHint(self):
+        return QtCore.QSize(*APP_TILE_SIZE)
+
+
+def _ring(icon, width_px, color):
+    """``icon`` with a ring of ``color`` round its own outline, ``width_px`` wide
+    (in device-independent pixels): the icon's shape grown on every side,
+    filled with the colour, the icon drawn back on top."""
+    dpr = icon.devicePixelRatio()
+    grow = int(round(width_px * dpr))
+    size = QtCore.QSize(icon.width() + 2 * grow, icon.height() + 2 * grow)
+    ring = QtGui.QPixmap(size)
+    ring.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(ring)
+    p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+    plain = QtGui.QPixmap(icon)
+    plain.setDevicePixelRatio(1.0)  # draw in device pixels while building the ring
+    p.drawPixmap(QtCore.QRect(QtCore.QPoint(0, 0), size), plain)
+    p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)
+    p.fillRect(ring.rect(), color)
+    p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+    p.drawPixmap(grow, grow, plain)
+    p.end()
+    ring.setDevicePixelRatio(dpr)
+    return ring
+
+
 class LauncherWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"MOLES Launcher {__version__}")
-        self.resize(860, 480)
+        self.resize(900, 520)
 
         # row index -> claim key, rebuilt on every refresh, so the
         # force-release button knows what the selected row refers to.
@@ -196,22 +306,30 @@ class LauncherWindow(QtWidgets.QMainWindow):
         # --- Top row: mascot logo + app launch buttons ---
         top_row = QtWidgets.QHBoxLayout()
 
+        self._logo_label = None
         logo = load_logo_pixmap()
         if not logo.isNull():
             logo_label = QtWidgets.QLabel()
-            logo_label.setPixmap(
-                logo.scaledToHeight(LOGO_HEIGHT_PX, QtCore.Qt.SmoothTransformation)
-            )
+            logo_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            # Scaled for the screen's real pixels, so it is as sharp as the tiles.
+            dpr = self.devicePixelRatioF()
+            logo = logo.scaledToHeight(int(LOGO_HEIGHT_PX * dpr), QtCore.Qt.SmoothTransformation)
+            logo.setDevicePixelRatio(dpr)
+            logo_label.setPixmap(logo)
             logo_label.setToolTip("Moley the Mole — MOLES mascot")
-            top_row.addWidget(logo_label, alignment=QtCore.Qt.AlignVCenter)
+            # Moved down to the icons' middle once laid out (_center_logo_on_icons).
+            top_row.addWidget(logo_label, alignment=QtCore.Qt.AlignTop)
+            self._logo_label = logo_label
 
         apps_group = QtWidgets.QGroupBox("Launch")
         apps_layout = QtWidgets.QHBoxLayout(apps_group)
+        apps_layout.setSpacing(4)
+        self.app_tiles = {}
         for label, module in APPS:
-            btn = QtWidgets.QPushButton(label)
-            btn.setMinimumHeight(40)
-            btn.clicked.connect(lambda _checked, m=module, l=label: self._launch(m, l))
-            apps_layout.addWidget(btn)
+            tile = AppTile(label, load_app_icon_pixmap(module))
+            tile.clicked.connect(lambda _checked=False, m=module, l=label: self._launch(m, l))
+            apps_layout.addWidget(tile)
+            self.app_tiles[module] = tile
         top_row.addWidget(apps_group, stretch=1)
         layout.addLayout(top_row)
 
@@ -391,6 +509,29 @@ class LauncherWindow(QtWidgets.QMainWindow):
         self._update_check.found.connect(self._update_offer.offer)
         self._update_check.start()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._center_logo_on_icons()
+
+    def _center_logo_on_icons(self):
+        """Line the logo's middle up with the middle of the app icons.
+
+        Centring it on the whole Launch box would leave it low, as the box's
+        title above the icons and the names under them are not the same
+        height. Where the icons end up depends on the platform's fonts and
+        box style, so this is measured once the window is laid out.
+        """
+        if self._logo_label is None or not self.app_tiles:
+            return
+        self.centralWidget().layout().activate()
+        tile = next(iter(self.app_tiles.values()))
+        icon_mid = tile.mapTo(self.centralWidget(),
+                              QtCore.QPoint(0, APP_ICON_TOP_PX + APP_ICON_PX // 2)).y()
+        pix = self._logo_label.pixmap()
+        logo_half = round(pix.height() / pix.devicePixelRatio() / 2)
+        self._logo_label.setContentsMargins(
+            0, max(0, icon_mid - self._logo_label.y() - logo_half), 0, 0)
+
     def closeEvent(self, event):
         # A check in progress holds claims and open ports; let it finish (it
         # takes about a second) rather than tear the thread down mid-read.
@@ -468,7 +609,7 @@ def main():
     install_qt_message_handler()
 
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.launcher")
     install_wheel_guard(app)
     win = LauncherWindow()
     win.show()

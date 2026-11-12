@@ -62,12 +62,14 @@ Source: "..\assets\MOLES.ico"; DestDir: "{app}\setup"; Flags: ignoreversion
 
 [Icons]
 ; pythonw.exe runs MOLES without a console window.
+; AppUserModelID matches the one the launcher gives itself (moles/ui/visual_identity.py),
+; so its taskbar button belongs to these shortcuts and pinning it pins them.
 Name: "{autoprograms}\MOLES"; Filename: "{app}\runtime\pythonw.exe"; \
     Parameters: "-m moles"; WorkingDir: "{userdocs}"; IconFilename: "{app}\setup\MOLES.ico"; \
-    Comment: "Open the MOLES launcher"
+    Comment: "Open the MOLES launcher"; AppUserModelID: "MOLES.Platform.Launcher"
 Name: "{autodesktop}\MOLES"; Filename: "{app}\runtime\pythonw.exe"; \
     Parameters: "-m moles"; WorkingDir: "{userdocs}"; IconFilename: "{app}\setup\MOLES.ico"; \
-    Comment: "Open the MOLES launcher"; Tasks: desktopicon
+    Comment: "Open the MOLES launcher"; AppUserModelID: "MOLES.Platform.Launcher"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\runtime\pythonw.exe"; Parameters: "-m moles"; WorkingDir: "{userdocs}"; \

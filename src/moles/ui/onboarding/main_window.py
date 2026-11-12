@@ -714,7 +714,7 @@ def _sort_key(name: str) -> int:
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.onboarding")
     install_wheel_guard(app)
     window = MainWindow()
     window.show()

@@ -151,7 +151,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.settings")
     install_wheel_guard(app)
     dlg = SettingsDialog()
     dlg.exec_()

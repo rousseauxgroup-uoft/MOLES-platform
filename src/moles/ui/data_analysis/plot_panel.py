@@ -21,6 +21,13 @@ points of the selected trace. Each batch of new labels can be undone.
 
 Export writes the window to an Excel workbook, or its figure to PNG or SVG,
 drawn again in the figure style by ``analysis.export``.
+
+Drawing stays quick with many long traces in two ways. Each curve shows only
+what the current view needs (``TraceCurve``, ``analysis.display.screen_trace``),
+fitted again as the view moves. And while the view is being dragged or zoomed,
+a slider dragged, or a label moved, solid traces are drawn with hairline pens
+and the selection glow is hidden: a wide antialiased line costs Qt some thirty
+times a hairline's. Full widths return a moment after the movement stops.
 """
 
 import logging
@@ -40,7 +47,7 @@ from ...analysis.appearance import (
     LEGEND_PAD_PT, LEGEND_ROW_EM, LEGEND_ROW_GAP_PT, LEGEND_SAMPLE_PT, MARKER_RIM_PT, TEXT_COLOR,
     TRACE_LINE_PT,
 )
-from ...analysis.display import every_nth, thin
+from ...analysis.display import every_nth, screen_trace, thin
 from ...analysis.export import (
     FigureLayout, export_workbook, figure_png, render_figure, save_figure,
 )
@@ -72,6 +79,21 @@ SIDE_PANEL_WIDTH = 430
 # as fast as the eye can follow.
 _RENDER_DELAY_MS = 30
 
+# How long after the last pan, zoom, or drag the traces return to full width.
+_SETTLE_MS = 150
+
+# Room drawn around the view when a trace is fitted to it, so panning a little
+# needs no new fit: a share of the view's size, plus pixels enough that a
+# trace's width and its glow are never cut at the edge.
+_FIT_SLACK = 0.1
+_FIT_MARGIN_PX = 16
+
+# While the view moves, a fit made at a scale up to this factor away from
+# the current one is kept rather than redone, so zooming with the wheel does
+# not fit every trace again at every step. The view is fitted exactly again
+# once it settles.
+_MOVING_SCALE_TOLERANCE = 1.5
+
 # How close (in pixels) a Label Point click must land to the selected trace.
 SNAP_RADIUS_PX = 15
 
@@ -100,13 +122,85 @@ class _DrawnLabel:
     leader: pg.PlotCurveItem
 
 
+class TraceCurve(pg.PlotCurveItem):
+    """A curve that holds a whole trace but draws only what the view needs.
+
+    ``trace_x`` and ``trace_y`` are the trace as displayed (offsets, range
+    and smoothing applied); the item's own data is that trace fitted to the
+    view (``show_fitted``). Its bounds are the whole trace's, so Fit View and
+    auto-range see all of it wherever the view is.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.opts["antialias"] = True
+        self.trace_x = self.trace_y = np.zeros(0)
+        self.reduce = True
+        self._bounds = ((None, None), (None, None))
+
+    def set_trace(self, x, y, reduce):
+        """Hold a new trace; ``reduce`` cuts it down per pixel column when fitted."""
+        self.trace_x = np.asarray(x, dtype=float)
+        self.trace_y = np.asarray(y, dtype=float)
+        self.reduce = reduce
+        self._bounds = tuple((float(d.min()), float(d.max())) if len(d) else (None, None)
+                             for d in (self.trace_x, self.trace_y))
+
+    def show_whole(self):
+        """Show the whole trace (thinned if long): for a view with no size yet."""
+        x, y = (thin(self.trace_x, self.trace_y) if self.reduce
+                else (self.trace_x, self.trace_y))
+        self.setData(x, y, connect="all")
+
+    def show_fitted(self, x, y, connect):
+        """Show the trace as ``screen_trace`` fitted it to the view."""
+        self.setData(x, y, connect=connect)
+
+    def dataBounds(self, ax, frac=1.0, orthoRange=None):
+        if orthoRange is None and frac >= 1.0:
+            return self._bounds[ax]
+        d, other = (self.trace_x, self.trace_y) if ax == 0 else (self.trace_y, self.trace_x)
+        if orthoRange is not None:
+            d = d[(other >= orthoRange[0]) & (other <= orthoRange[1])]
+        if len(d) == 0:
+            return (None, None)
+        if frac >= 1.0:
+            return (float(d.min()), float(d.max()))
+        return tuple(float(v) for v in np.percentile(d, [50 * (1 - frac), 50 * (1 + frac)]))
+
+
 @dataclass
 class _Drawn:
     """The plot items drawn for one experiment."""
 
-    curve: pg.PlotCurveItem
-    glow: pg.PlotCurveItem
+    curve: TraceCurve
+    glow: TraceCurve
     labels: List[_DrawnLabel] = field(default_factory=list)
+    pen: object = None          # the trace's pen at rest
+    moving_pen: object = None   # its pen while the view moves (None: the same)
+    fitted: object = None       # (region, pixel size) the shown data was fitted to
+
+
+def _fit_region(rect, pixel_size):
+    """The region a trace is fitted to for a view: the view, its slack, and its margin."""
+    x0, x1, y0, y1 = rect
+    sx, sy = pixel_size
+    mx = _FIT_SLACK * (x1 - x0) + _FIT_MARGIN_PX * sx
+    my = _FIT_SLACK * (y1 - y0) + _FIT_MARGIN_PX * sy
+    return (x0 - mx, x1 + mx, y0 - my, y1 + my)
+
+
+def _covers(fitted, view, tolerance=1.0):
+    """Whether data fitted as ``fitted`` still serves ``view``: drawn at the
+    same scale (or within ``tolerance`` times it), with the view and its edge
+    margin inside the region fitted."""
+    (fx0, fx1, fy0, fy1), (fsx, fsy) = fitted
+    (x0, x1, y0, y1), (sx, sy) = view
+    limit = max(tolerance, 1 + 1e-6)
+    if not all(1 / limit <= fitted_px / px <= limit for fitted_px, px in ((fsx, sx), (fsy, sy))):
+        return False
+    mx, my = _FIT_MARGIN_PX * sx, _FIT_MARGIN_PX * sy
+    return x0 - mx >= fx0 and x1 + mx <= fx1 and y0 - my >= fy0 and y1 + my <= fy1
 
 
 def _droppable(mime):
@@ -170,6 +264,13 @@ class PlotPanel(QtWidgets.QWidget):
         self._render_timer.setInterval(_RENDER_DELAY_MS)
         self._render_timer.timeout.connect(self._flush)
 
+        # While the view moves, traces are drawn thin (see the module notes).
+        self._moving = False
+        self._settle_timer = QtCore.QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(_SETTLE_MS)
+        self._settle_timer.timeout.connect(self._settle)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -179,9 +280,11 @@ class PlotPanel(QtWidgets.QWidget):
         self.view_box.box_drawn.connect(self.pick_in_box)
         self.view_box.clicked_at.connect(self.label_at)
         self.view_box.empty_clicked.connect(lambda: self.select(None))
+        self.view_box.box_dragging.connect(self._view_moving)
         # Label text sits a fixed distance from its point on screen, so it is
-        # placed again whenever zooming or resizing changes the scale.
-        self.view_box.sigTransformChanged.connect(self._place_all_labels)
+        # placed again whenever zooming or resizing changes the scale; traces
+        # are fitted to the new view too.
+        self.view_box.sigTransformChanged.connect(self._on_transform_changed)
         self.plot_widget = pg.PlotWidget(background=BACKGROUND, viewBox=self.view_box)
         self.plot_item = self.plot_widget.getPlotItem()
         style_plot(self.plot_item, self.state.style, self._px_per_pt())
@@ -194,8 +297,8 @@ class PlotPanel(QtWidgets.QWidget):
         if self.state.legend_box is not None:
             self.legend.anchor(itemPos=(0, 0), parentPos=self.state.legend_box)
         # NOTE: no pyqtgraph clip-to-view or auto-downsampling here: both assume
-        # an x-axis that only increases, which a voltammogram's is not. Long
-        # traces are thinned along point order instead (analysis.display).
+        # an x-axis that only increases, which a voltammogram's is not. Traces
+        # are fitted to the view along point order instead (TraceCurve).
         self.plot_item.getViewBox().sigRangeChangedManually.connect(self._on_view_moved)
 
         self.side_panel = self._build_side_panel()
@@ -393,9 +496,9 @@ class PlotPanel(QtWidgets.QWidget):
                 self._attach_missing(exp, "A different file now has its name.", position)
                 return
         self._datasets[exp.uid] = dataset
-        glow = pg.PlotCurveItem()
+        glow = TraceCurve()
         glow.setZValue(_Z_CURVE - 0.5)
-        curve = pg.PlotCurveItem()
+        curve = TraceCurve()
         curve.setClickable(True, width=CLICK_TOLERANCE_PX)
         curve.sigClicked.connect(lambda _item, ev, uid=exp.uid: self._on_curve_clicked(uid, ev))
         self.plot_item.addItem(glow)
@@ -552,8 +655,7 @@ class PlotPanel(QtWidgets.QWidget):
             is_selected = uid == selected
             drawn.curve.setZValue(_Z_SELECTED if is_selected else _Z_CURVE)
             drawn.glow.setZValue((_Z_SELECTED if is_selected else _Z_CURVE) - 0.5)
-            exp = self.state.experiment(uid)
-            drawn.glow.setVisible(is_selected and exp is not None and exp.visible)
+            drawn.glow.setVisible(self._glows(uid))
             self._cards[uid].set_selected(is_selected)
         if selected in self._cards:
             self._scroll.ensureWidgetVisible(self._cards[selected])
@@ -587,6 +689,7 @@ class PlotPanel(QtWidgets.QWidget):
         elif what == CHANGED_LABELS:
             self._render_labels(uid)
         elif what == CHANGED_DATA:
+            self._view_moving()
             self._pending.add(uid)
             self._render_timer.start()
         self.changed.emit()
@@ -616,12 +719,91 @@ class PlotPanel(QtWidgets.QWidget):
         glow_pen.setJoinStyle(QtCore.Qt.RoundJoin)
 
         _indices, x, y = exp.displayed_arrays(dataset)
-        x, y = thin(x, y) if exp.line_style == "solid" else every_nth(x, y)
-        drawn.curve.setData(x, y, pen=pen, antialias=True)
-        drawn.glow.setData(x, y, pen=glow_pen, antialias=True)
+        solid = exp.line_style == "solid"
+        if not solid:
+            x, y = every_nth(x, y)
+        drawn.pen = pen
+        # Dashed traces are few points and cheap; only solid ones go thin.
+        drawn.moving_pen = pg.mkPen(color, width=1) if solid else None
+        drawn.curve.setPen(self._pen_for(drawn))
+        drawn.glow.setPen(glow_pen)
+        for item in (drawn.curve, drawn.glow):
+            item.set_trace(x, y, reduce=solid)
+        drawn.fitted = None
         drawn.curve.setVisible(exp.visible)
-        drawn.glow.setVisible(exp.visible and uid == self.state.selected_uid)
+        drawn.glow.setVisible(self._glows(uid))
+        self._fit_to_view(uid)
         self._render_labels(uid)
+
+    # ------------------------------------------------------------------
+    # Fitting traces to the view, and drawing them thin while it moves
+    # ------------------------------------------------------------------
+
+    def _glows(self, uid):
+        exp = self.state.experiment(uid)
+        return (uid == self.state.selected_uid and exp is not None and exp.visible
+                and not self._moving)
+
+    def _pen_for(self, drawn):
+        return drawn.moving_pen if self._moving and drawn.moving_pen is not None else drawn.pen
+
+    def _view_moving(self, *_args):
+        """The view, a trace, or a label is being dragged: draw thin until it stops."""
+        self._settle_timer.start()
+        if not self._moving:
+            self._moving = True
+            self._apply_pens()
+
+    def _settle(self):
+        self._moving = False
+        self._fit_to_view()
+        self._apply_pens()
+
+    def _apply_pens(self):
+        for uid, drawn in self._drawn.items():
+            if drawn.pen is not None:
+                drawn.curve.setPen(self._pen_for(drawn))
+            drawn.glow.setVisible(self._glows(uid))
+
+    def _on_transform_changed(self, *_args):
+        self._fit_to_view()
+        self._place_all_labels()
+
+    def _current_view(self):
+        """``(view rectangle, pixel size)`` in data units, or None while the view has no size."""
+        try:
+            (x0, x1), (y0, y1) = self.view_box.viewRange()
+            sx, sy = self.view_box.viewPixelSize()
+        except Exception:
+            return None
+        if not all(np.isfinite(v) for v in (x0, x1, y0, y1, sx, sy)) or sx <= 0 or sy <= 0:
+            return None
+        return (x0, x1, y0, y1), (sx, sy)
+
+    def _fit_to_view(self, uid=None):
+        """Fit traces (one, or all) to the view, unless what they show still covers it."""
+        view = self._current_view()
+        uids = list(self._drawn) if uid is None else [uid]
+        for u in uids:
+            drawn = self._drawn[u]
+            exp = self.state.experiment(u)
+            if exp is None or not exp.visible:
+                continue  # fitted when shown again (_render)
+            tolerance = _MOVING_SCALE_TOLERANCE if self._moving else 1.0
+            if view is not None and drawn.fitted is not None \
+                    and _covers(drawn.fitted, view, tolerance):
+                continue
+            if view is None:
+                drawn.curve.show_whole()
+                drawn.glow.show_whole()
+                drawn.fitted = None
+                continue
+            region = _fit_region(*view)
+            x, y, connect = screen_trace(drawn.curve.trace_x, drawn.curve.trace_y, region,
+                                         view[1], reduce=drawn.curve.reduce)
+            drawn.curve.show_fitted(x, y, connect)
+            drawn.glow.show_fitted(x, y, connect)
+            drawn.fitted = (region, view[1])
 
     def _remove_label_items(self, drawn):
         for dl in drawn.labels:
@@ -689,6 +871,8 @@ class PlotPanel(QtWidgets.QWidget):
         self._place_label(dl)
         if finished:
             self.changed.emit()
+        else:
+            self._view_moving()
 
     def _reset_label(self, uid, label):
         label.text_offset = None
@@ -880,6 +1064,7 @@ class PlotPanel(QtWidgets.QWidget):
         self.view_changed.emit()
 
     def _on_view_moved(self, *_args):
+        self._view_moving()
         (x0, x1), (y0, y1) = self.plot_item.getViewBox().viewRange()
         self.state.view_range = (x0, x1, y0, y1)
         self.view_changed.emit()

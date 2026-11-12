@@ -2113,7 +2113,7 @@ def main():
     install_qt_message_handler()
 
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.electrolysis")
     install_wheel_guard(app)
     pg.setConfigOption('background', 'w')
     pg.setConfigOption('foreground', 'k')

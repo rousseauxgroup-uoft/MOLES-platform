@@ -62,7 +62,7 @@ def main():
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.electroanalysis")
     install_wheel_guard(app)
     window = MainWindow()
     window.show()
