@@ -386,7 +386,12 @@ def test_every_cv_and_dpv_is_zeroed_at_open_circuit_and_records_the_ocp(window, 
     class _Spy(MockLivePotentiostat):
         def read_ocp(self, restore_switch_state=True):
             order.append(('ocp', self._switch_state))
+            self._switch_state = False
             return 0.1234
+
+        def read_potential_calibrated(self):
+            # The rest of the readings the OCP is a median of
+            return np.array([0.1234])
 
         def tare_current(self, n_readings=10):
             order.append(('tare', self._switch_state))

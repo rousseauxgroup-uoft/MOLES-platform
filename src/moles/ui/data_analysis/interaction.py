@@ -37,6 +37,7 @@ class PickViewBox(pg.ViewBox):
     box_drawn = QtCore.pyqtSignal(object)    # QRectF in data coordinates
     clicked_at = QtCore.pyqtSignal(object)   # QPointF in data coordinates (Label Point)
     empty_clicked = QtCore.pyqtSignal()      # a left click on empty space (other modes)
+    box_dragging = QtCore.pyqtSignal()       # the picking box moved (Box Pick)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,6 +58,7 @@ class PickViewBox(pg.ViewBox):
             self.box_drawn.emit(self.childGroup.mapRectFromParent(rect).normalized())
         else:
             self.updateScaleBox(ev.buttonDownPos(), ev.pos())
+            self.box_dragging.emit()
 
     def mouseClickEvent(self, ev):
         if ev.button() == QtCore.Qt.LeftButton:

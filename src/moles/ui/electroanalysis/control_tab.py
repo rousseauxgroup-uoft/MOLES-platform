@@ -21,44 +21,16 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
-from ...calibration import get_potentiostat_ports
-from ...driver.ps4_ref import HW_VOLTAGE_COMPLIANCE_V, VOLTAGE_WARN_THRESHOLD_V
+from ...calibration import connected_ports, get_potentiostat_ports
+from ...driver.ps4_ref import HW_VOLTAGE_COMPLIANCE_V
+from ...analysis.smoothing import smooth
 from ...methods.dpv import process_dpv
-from ...settings import get_cv_data_folder
+from ...settings import get_cv_data_folder, get_show_unconnected_potentiostats
 from ..scrollable_plots import PlotScrollArea, apply_scroll_height
 from .widgets import PotentiostatPanel
-from .workers import DPV_SAMPLE_HZ, RuWorker, VoltammetryWorker
+from .workers import (DPV_SAMPLE_HZ, RuWorker, VoltammetryWorker,
+                      potentials_beyond_compliance as _potentials_beyond_compliance)
 
-
-def _potentials_beyond_compliance(params):
-    """Return the requested potentials this run cannot physically reach.
-
-    Collects the extreme potentials the waveform will ask for (for DPV the
-    pulse rides on top of the staircase in the scan direction, so the pulsed
-    points sit beyond the plain sweep limits) and returns those beyond the
-    warning threshold.
-    """
-    if params.get('method') == 'OCP':
-        return []  # nothing is driven: the cell stays disconnected throughout
-    if params.get('method') == 'DPV':
-        pulse = abs(params.get('pulse_V', 0.0))
-        if params.get('dpv_type') == 'cyclic':
-            lo = params.get('min_V', 0.0)
-            hi = params.get('max_V', 0.0)
-            # Pulses push past the window: up at the top, down at the bottom.
-            # Start/End V can sit outside the vertices, so include them too.
-            extremes = [lo, hi, hi + pulse, lo - pulse,
-                        params.get('start_V', 0.0), params.get('end_V', 0.0)]
-        else:
-            start = params.get('start_V', 0.0)
-            end = params.get('end_V', 0.0)
-            # The pulse rides in the scan direction, so the far end is pushed
-            # further out than End V itself.
-            direction = 1.0 if end >= start else -1.0
-            extremes = [start, end, end + direction * pulse]
-    else:
-        extremes = [params.get(k, 0.0) for k in ('start_V', 'min_V', 'max_V', 'last_V')]
-    return sorted({v for v in extremes if abs(v) > VOLTAGE_WARN_THRESHOLD_V})
 
 # Per-channel trace colours, one per potentiostat slot A–H.
 _CHANNEL_COLORS = {
@@ -136,6 +108,13 @@ class ControlTab(QtWidgets.QWidget):
         self._panel_layout.addStretch()
         scroll.setWidget(self._panel_container)
         left_layout.addWidget(scroll)
+
+        # Shown instead of the panels when no board is listed.
+        self.empty_label = QtWidgets.QLabel()
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setStyleSheet("color: gray;")
+        self.empty_label.setVisible(False)
+        left_layout.insertWidget(left_layout.indexOf(scroll), self.empty_label)
 
         # --- Right: grid of live plots, one per device ---
         # The grid sits in its own panel with a pop-out button so the whole grid
@@ -215,6 +194,36 @@ class ControlTab(QtWidgets.QWidget):
             return dict(_MOCK_PORTS)
         return get_potentiostat_ports()
 
+    def _listed_ports(self):
+        """Return ``(ports to list, pot_ids not plugged in, count hidden)``.
+
+        Registered boards that are not plugged in are left out unless the
+        user chose to see them in Settings; then they are listed greyed out.
+        Mock boards are always present.
+        """
+        ports = self._current_ports()
+        if self.test_mode_cb.isChecked():
+            return ports, set(), 0
+        present = connected_ports(ports.values())
+        absent = {pid for pid, port in ports.items() if port not in present}
+        if get_show_unconnected_potentiostats():
+            return ports, absent, 0
+        listed = {pid: port for pid, port in ports.items() if pid not in absent}
+        return listed, set(), len(absent)
+
+    def _port_to_use(self, pot_id):
+        """This board's port if it is registered and plugged in; else report
+        why on its panel and return None."""
+        port = self._current_ports().get(pot_id)
+        if not port:
+            self._panels[pot_id].update_status("Error: Port not found")
+            return None
+        if not self.test_mode_cb.isChecked() and not connected_ports([port]):
+            self._panels[pot_id].update_status(
+                "Error: Not connected — plug the board in and press Refresh Ports.")
+            return None
+        return port
+
     def refresh_ports(self):
         """Re-scan for devices and rebuild both the panel list and plot grid."""
         # Clear panels.
@@ -239,13 +248,30 @@ class ControlTab(QtWidgets.QWidget):
         self._dpv_view = {}
         self._dirty.clear()
 
-        ports = self._current_ports()
+        ports, absent, hidden = self._listed_ports()
         for idx, pid in enumerate(sorted(ports.keys())):
             self._add_panel(pid)
             self._add_plot(pid, idx)
+            if pid in absent:
+                self._panels[pid].set_connected(False)
         self._panel_layout.addStretch()
+        self._update_empty_label(len(ports), hidden)
         # Resize the scroll grid so 8 plots stay in view for the new device count.
         self._update_plot_scroll_height()
+
+    def _update_empty_label(self, listed, hidden):
+        """Explain an empty device list, including boards hidden as unplugged."""
+        if listed:
+            self.empty_label.setVisible(False)
+            return
+        if hidden:
+            text = (f"No potentiostats are plugged in ({hidden} registered "
+                    f"board{'s' if hidden != 1 else ''} hidden). Connect one and "
+                    "press Refresh Ports, or list unplugged boards in MOLES Settings.")
+        else:
+            text = "No potentiostats registered — run MOLES Onboarding."
+        self.empty_label.setText(text)
+        self.empty_label.setVisible(True)
 
     def _update_plot_scroll_height(self):
         """Size the live-plot grid so 8 plots stay in view and the rest scroll."""
@@ -286,8 +312,10 @@ class ControlTab(QtWidgets.QWidget):
         pen_raw, pen_smooth = self._make_pens(pid)
         raw = p.plot([], [], pen=pen_raw, name="Raw")
         smooth = p.plot([], [], pen=pen_smooth, name="Smoothed")
+        marker = self._make_marker(p, pid)
 
-        self._plots[pid] = {'plot': p, 'raw': raw, 'smooth': smooth}
+        self._plots[pid] = {'plot': p, 'raw': raw, 'smooth': smooth,
+                            'marker': marker}
         self._ylabels[pid] = (ytext, yunits)
         self._xlabels[pid] = (xtext, xunits)
         self._dpv_view[pid] = 'differential'
@@ -300,6 +328,17 @@ class ControlTab(QtWidgets.QWidget):
         pen_smooth = pg.mkPen(color=color, width=2)
         return pen_raw, pen_smooth
 
+    @staticmethod
+    def _make_marker(plot_item, pid):
+        """Add the round marker that shows the newest point of a running
+        experiment. It has no name, so it stays out of the legend."""
+        color = _CHANNEL_COLORS.get(pid, 'b')
+        marker = plot_item.plot(
+            [], [], pen=None, symbol='o', symbolSize=11.25,
+            symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen('k', width=1.875))
+        marker.setZValue(10)
+        return marker
+
     # ------------------------------------------------------------------
     # Experiment lifecycle
     # ------------------------------------------------------------------
@@ -309,7 +348,10 @@ class ControlTab(QtWidgets.QWidget):
         # Warn before starting a sweep the hardware cannot deliver: beyond the
         # output compliance the recorded potential flattens while the software
         # keeps scanning, which silently corrupts that segment of the data.
-        offenders = _potentials_beyond_compliance(params)
+        # Potentials entered vs OCP are only known once the worker measures
+        # it, so the worker checks those itself.
+        offenders = ([] if params.get('vs_ocp')
+                     else _potentials_beyond_compliance(params))
         if offenders:
             listed = ", ".join(f"{v:+.2f} V" for v in offenders)
             reply = QtWidgets.QMessageBox.warning(
@@ -328,10 +370,8 @@ class ControlTab(QtWidgets.QWidget):
                 self._panels[pot_id].update_status("Start cancelled (potential limit).")
                 return
 
-        ports = self._current_ports()
-        port = ports.get(pot_id)
-        if not port:
-            self._panels[pot_id].update_status("Error: Port not found")
+        port = self._port_to_use(pot_id)
+        if port is None:
             return
 
         self._live_data[pot_id] = self._empty_live_data()
@@ -341,6 +381,7 @@ class ControlTab(QtWidgets.QWidget):
         if pot_id in self._plots:
             self._set_curve(pot_id, 'raw', [], [])
             self._set_curve(pot_id, 'smooth', [], [])
+            self._set_curve(pot_id, 'marker', [], [])
             # Point the axes at whatever this run will plot (a prior run may have
             # relabelled them, and DPV depends on the selected live view).
             if self.method == 'DPV':
@@ -368,10 +409,8 @@ class ControlTab(QtWidgets.QWidget):
             self._panels[pot_id].update_status("Busy — experiment running.")
             return
 
-        ports = self._current_ports()
-        port = ports.get(pot_id)
-        if not port:
-            self._panels[pot_id].update_status("Error: Port not found")
+        port = self._port_to_use(pot_id)
+        if port is None:
             return
 
         panel = self._panels[pot_id]
@@ -458,8 +497,7 @@ class ControlTab(QtWidgets.QWidget):
                 continue
             v, i = self._merged_arrays(data)
             x, y = self._live_xy(pid, v, i)
-            window = self._panels[pid].smooth_spin.value()
-            self._render_curves(pid, x, y, window)
+            self._render_curves(pid, x, y, self._panels[pid].smoothing.value())
         # Nothing left to stream and nothing left to paint: idle the timer.
         if not self._active_workers and not self._dirty:
             self._plot_timer.stop()
@@ -496,26 +534,35 @@ class ControlTab(QtWidgets.QWidget):
             return np.array([]), np.array([])
         return diff[:, 0], diff[:, 1]
 
-    def _render_curves(self, pid, v, i, window):
+    def _render_curves(self, pid, v, i, smoothing):
         """Draw the raw and smoothed traces, thinned for display.
 
         ``v``/``i`` are the display coordinates (already transformed for DPV by
         :meth:`_live_xy`), not necessarily the raw potential/current. Beyond
         ``MAX_RENDER_POINTS`` only every Nth point is drawn (the full data is
-        untouched and saved at full resolution). The smoothing window is scaled
-        by the same factor so the smoothed trace still averages over the same
-        span of the sweep.
+        untouched and saved at full resolution). ``smoothing`` is the panel's
+        ``(method, window)``; the window is scaled by the same factor so the
+        smoothed trace still covers the same span of the sweep.
+
+        While the channel's experiment is running, a round marker sits on the
+        newest point (taken from the full data, so thinning never hides it),
+        showing where the potentiostat is even when sweeps overlap.
         """
         v = np.asarray(v, dtype=float)
         i = np.asarray(i, dtype=float)
         stride = max(1, int(np.ceil(v.size / MAX_RENDER_POINTS)))
         v_r, i_r = v[::stride], i[::stride]
+        method, window = smoothing
         window_r = max(1, int(round(window / stride)))
         self._set_curve(pid, 'raw', v_r, i_r)
-        self._apply_smoothing(pid, v_r, i_r, window_r)
+        self._set_curve(pid, 'smooth', v_r, smooth(i_r, method, window_r))
+        if pid in self._active_workers and v.size and i.size:
+            self._set_curve(pid, 'marker', v[-1:], i[-1:])
+        else:
+            self._set_curve(pid, 'marker', [], [])
 
-    def update_smoothing(self, pot_id, window):
-        """Re-apply smoothing when the user changes the smoothing spinbox."""
+    def update_smoothing(self, pot_id):
+        """Re-apply smoothing when the user changes a panel's smoothing."""
         data = self._live_data.get(pot_id)
         if not data or pot_id not in self._plots:
             return
@@ -523,7 +570,7 @@ class ControlTab(QtWidgets.QWidget):
         if i.size == 0:
             return
         x, y = self._live_xy(pot_id, v, i)
-        self._render_curves(pot_id, x, y, window)
+        self._render_curves(pot_id, x, y, self._panels[pot_id].smoothing.value())
 
     def update_live_view(self, pot_id, view):
         """Switch a DPV channel between the differential and time-series view."""
@@ -536,8 +583,7 @@ class ControlTab(QtWidgets.QWidget):
             return
         v, i = self._merged_arrays(data)
         x, y = self._live_xy(pot_id, v, i)
-        window = self._panels[pot_id].smooth_spin.value()
-        self._render_curves(pot_id, x, y, window)
+        self._render_curves(pot_id, x, y, self._panels[pot_id].smoothing.value())
 
     def _apply_dpv_labels(self, pid):
         """Label the axes for the DPV live view this channel is showing."""
@@ -548,17 +594,8 @@ class ControlTab(QtWidgets.QWidget):
             self._set_left_label(pid, 'Delta-i', 'uA')
             self._set_bottom_label(pid, 'Potential', 'V')
 
-    def _apply_smoothing(self, pot_id, v_data, i_data, window):
-        """Update the smoothed trace using a moving average of width ``window``."""
-        if window > 1 and len(i_data) > window:
-            kernel = np.ones(window) / window
-            i_smooth = np.convolve(i_data, kernel, mode='same')
-            self._set_curve(pot_id, 'smooth', v_data, i_smooth)
-        else:
-            self._set_curve(pot_id, 'smooth', v_data, i_data)
-
     def _set_curve(self, pid, which, x, y):
-        """Update one trace ('raw' or 'smooth') on the grid plot and, if the
+        """Update one trace ('raw', 'smooth' or 'marker') on the grid plot and, if the
         channel is also showing in a pop-out window, on that copy too."""
         self._plots[pid][which].setData(x, y)
         po = self._popouts.get(pid)
@@ -643,17 +680,18 @@ class ControlTab(QtWidgets.QWidget):
         pen_raw, pen_smooth = self._make_pens(pid)
         raw = p.plot([], [], pen=pen_raw, name="Raw")
         smooth = p.plot([], [], pen=pen_smooth, name="Smoothed")
+        marker = self._make_marker(p, pid)
         win._vbox.addWidget(plot_w)
 
         # Register before seeding so the helpers below also fill the new window.
-        self._popouts[pid] = {'win': win, 'plot': p, 'raw': raw, 'smooth': smooth}
+        self._popouts[pid] = {'win': win, 'plot': p, 'raw': raw, 'smooth': smooth,
+                              'marker': marker}
         win.closed.connect(lambda: self._close_channel_popout(pid))
 
         data = self._live_data.get(pid, self._empty_live_data())
         v, i = self._merged_arrays(data)
         x, y = self._live_xy(pid, v, i)
-        window = self._panels[pid].smooth_spin.value()
-        self._render_curves(pid, x, y, window)
+        self._render_curves(pid, x, y, self._panels[pid].smoothing.value())
         win.show()
 
     def _close_channel_popout(self, pid):
@@ -677,6 +715,10 @@ class ControlTab(QtWidgets.QWidget):
     def _on_finished(self, pot_id, success, msg, result, filepath):
         """Handle worker completion: finalize the plot and announce the save."""
         self._active_workers.pop(pot_id, None)
+        # The run is over, so the newest-point marker goes (the final repaint
+        # below would also drop it, but stopped and failed runs skip that).
+        if pot_id in self._plots:
+            self._set_curve(pot_id, 'marker', [], [])
         # Every outcome is a final state, so the panel re-enables Run
         if not (success or msg == "Stopped" or msg.startswith("Error")):
             msg = f"Error: {msg}"
@@ -701,15 +743,13 @@ class ControlTab(QtWidgets.QWidget):
             self._apply_dpv_labels(pot_id)
             v, i = self._merged_arrays(self._live_data[pot_id])
             x, y = self._live_xy(pot_id, v, i)
-            window = self._panels[pot_id].smooth_spin.value()
-            self._render_curves(pot_id, x, y, window)
+            self._render_curves(pot_id, x, y, self._panels[pot_id].smoothing.value())
         else:
             # CV / OCP: sync the plot to the final saved trace — (potential,
             # current) for a CV, (time, potential) for an OCP run.
             v, i = np.asarray(result['raw_v'], dtype=float), np.asarray(result['raw_i'], dtype=float)
             self._live_data[pot_id] = {'v': v, 'i': i, 'v_new': [], 'i_new': []}
-            window = self._panels[pot_id].smooth_spin.value()
-            self._render_curves(pot_id, v, i, window)
+            self._render_curves(pot_id, v, i, self._panels[pot_id].smoothing.value())
 
         if filepath:
             self.run_finished.emit(filepath)

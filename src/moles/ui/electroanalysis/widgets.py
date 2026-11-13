@@ -14,6 +14,8 @@ from PyQt5 import QtCore, QtWidgets
 from ...driver.ps4_ref import (DEFAULT_QUIET_S, IR_MAX_FRACTION, NOMINAL_DAC_STEP_V,
                                 RANGE_LABELS)
 from ...methods.dpv import applied_dpv_settings, samples_per_segment
+from ...settings import DEFAULT_SMOOTHING
+from ..smoothing_control import SmoothingControl
 from .workers import CV_STEP_HZ, DPV_SAMPLE_HZ, IR_STEP_HZ
 
 # Potential step per point above which a sweep (batched or iR-compensated) is
@@ -49,6 +51,25 @@ def _quiet_time_spin():
         "Time the cell is held at the first potential, connected, before the\n"
         "scan starts, so the first points are not a switch-on transient.")
     return spin
+
+
+def _vs_ocp_checkbox(spins):
+    """The 'vs OCP' choice shared by the CV and DPV forms. When ticked, the
+    potentials in ``spins`` are offsets from the open-circuit potential the run
+    measures just before it starts, and each box says so."""
+    box = QtWidgets.QCheckBox("Potentials vs OCP")
+    box.setToolTip(
+        "Ticked: every potential below is relative to the open-circuit\n"
+        "potential, measured just before the run (0 V = start at rest).\n"
+        "Unticked: potentials are vs the reference electrode.\n"
+        "Either way the saved potentials are vs the reference electrode;\n"
+        "the measured OCP is recorded in the params file.")
+
+    def _relabel(checked):
+        for spin in spins:
+            spin.setSuffix(" vs OCP" if checked else "")
+    box.toggled.connect(_relabel)
+    return box
 
 
 class CVConfigWidget(QtWidgets.QWidget):
@@ -92,6 +113,10 @@ class CVConfigWidget(QtWidgets.QWidget):
             "Negative: Start → Min\nPositive: Start → Max"
         )
         layout.addRow("Direction:", self.direction_combo)
+
+        self.vs_ocp = _vs_ocp_checkbox(
+            (self.start_v, self.min_v, self.max_v, self.last_v))
+        layout.addRow("", self.vs_ocp)
 
         self.cycles = QtWidgets.QSpinBox()
         self.cycles.setRange(1, 100)
@@ -266,6 +291,7 @@ class CVConfigWidget(QtWidgets.QWidget):
             'min_V': self.min_v.value(),
             'max_V': self.max_v.value(),
             'last_V': self.last_v.value(),
+            'vs_ocp': self.vs_ocp.isChecked(),
             'scan_direction': self.direction_combo.currentText(),
             'cycles': self.cycles.value(),
             'mV_s': self.scan_rate.value(),
@@ -532,6 +558,11 @@ class DPVConfigWidget(QtWidgets.QWidget):
         cyclic_form.addRow("Cycles:", self.cycles)
         layout.addRow(self.cyclic_box)
 
+        self.vs_ocp = _vs_ocp_checkbox(
+            (self.start_v, self.end_v, self.cyc_start_v, self.min_v,
+             self.max_v, self.cyc_end_v))
+        layout.addRow("", self.vs_ocp)
+
         self.pulse_v = QtWidgets.QDoubleSpinBox()
         self.pulse_v.setRange(0, 1.0)
         self.pulse_v.setSingleStep(0.01)
@@ -659,6 +690,7 @@ class DPVConfigWidget(QtWidgets.QWidget):
             'p_hold': self.step_width.value(),
             'quiet_time_s': self.quiet_time.value(),
             'current_range': self.current_range.currentData(),
+            'vs_ocp': self.vs_ocp.isChecked(),
         }
         if self.type_combo.currentText() == "Cyclic":
             params.update({
@@ -772,7 +804,7 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
     """Control panel for one potentiostat within a CV, DPV, or OCP tab."""
 
     run_requested = QtCore.pyqtSignal(str, object)   # pot_id, params dict
-    smoothing_changed = QtCore.pyqtSignal(str, int)  # pot_id, window size
+    smoothing_changed = QtCore.pyqtSignal(str)       # pot_id
     live_view_changed = QtCore.pyqtSignal(str, str)  # pot_id, DPV view key
     stop_requested = QtCore.pyqtSignal(str)          # pot_id
     measure_ru_requested = QtCore.pyqtSignal(str)    # pot_id
@@ -827,12 +859,9 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
 
         smooth_layout = QtWidgets.QHBoxLayout()
         smooth_layout.addWidget(QtWidgets.QLabel("Smoothing:"))
-        self.smooth_spin = QtWidgets.QSpinBox()
-        self.smooth_spin.setRange(1, 100)
-        self.smooth_spin.setValue(1)
-        self.smooth_spin.setSuffix(" pts")
-        self.smooth_spin.valueChanged.connect(self._on_smooth_changed)
-        smooth_layout.addWidget(self.smooth_spin)
+        self.smoothing = SmoothingControl(*DEFAULT_SMOOTHING)
+        self.smoothing.changed.connect(self._on_smooth_changed)
+        smooth_layout.addWidget(self.smoothing, stretch=1)
         layout.addLayout(smooth_layout)
 
         run_text = "Start Monitoring" if method == 'OCP' else "Run Experiment"
@@ -881,8 +910,21 @@ class PotentiostatPanel(QtWidgets.QGroupBox):
         if hasattr(self.config, 'set_measured_r_u'):
             self.config.set_measured_r_u(value_ohm)
 
-    def _on_smooth_changed(self, val):
-        self.smoothing_changed.emit(self.pot_id, val)
+    def _on_smooth_changed(self, *_):
+        self.smoothing_changed.emit(self.pot_id)
+
+    def set_connected(self, connected):
+        """Grey out a registered board that is not plugged in, so it cannot be
+        started until it is connected and the ports are refreshed."""
+        self.setEnabled(connected)
+        if connected:
+            self.status_label.setText("Status: Idle")
+            self.status_label.setToolTip("")
+        else:
+            self.status_label.setText("Status: Not connected")
+            self.status_label.setToolTip(
+                "This board is registered but not plugged in. Connect it and "
+                "press Refresh Ports.")
 
     def _on_live_view_changed(self, idx):
         self.live_view_changed.emit(self.pot_id, self._DPV_LIVE_VIEWS[idx][1])

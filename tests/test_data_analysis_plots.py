@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from moles.analysis.display import DISPLAY_POINTS, every_nth, thin
+from moles.analysis.display import (
+    DISPLAY_POINTS, clip_polyline, every_nth, screen_trace, thin,
+)
 from moles.analysis.model import LabelledPoint, MIN_RANGE_POINTS
 
 CV_HEADER = "Time (s),Potential (V),Current (uA),Cycle,Index,Target V,Range"
@@ -46,6 +48,67 @@ def test_every_nth_keeps_both_ends():
     tx, _ty = every_nth(x, x, max_points=2000)
 
     assert tx[0] == 0 and tx[-1] == 10_000 and len(tx) <= 2002
+
+
+def test_clipping_keeps_a_trace_inside_the_view_whole():
+    x = np.linspace(0, 1, 50)
+
+    cx, cy, connect = clip_polyline(x, x, (-1, 2, -1, 2))
+
+    np.testing.assert_array_equal(cx, x)
+    assert connect[:-1].all() and not connect[-1]
+
+
+def test_clipping_cuts_segments_at_the_edges_and_breaks_the_line():
+    # In, far out to the right, back in: two pieces, each ending on the edge.
+    x = np.array([0.2, 0.4, 100.0, 0.6, 0.8])
+    y = np.array([0.5, 0.5, 0.5, 0.5, 0.5])
+
+    cx, cy, connect = clip_polyline(x, y, (0, 1, 0, 1))
+
+    np.testing.assert_allclose(cx, [0.2, 0.4, 1.0, 1.0, 0.6, 0.8])
+    assert connect.tolist() == [True, True, False, True, True, False]
+    assert cx.max() <= 1.0
+
+
+def test_clipping_keeps_a_segment_that_only_passes_through():
+    # Both ends far outside: what crosses the view is still drawn.
+    cx, cy, connect = clip_polyline([-1e6, 1e6], [0.5, 0.5], (0, 1, 0, 1))
+
+    np.testing.assert_allclose(cx, [0.0, 1.0])
+    assert connect.tolist() == [True, False]
+    assert len(clip_polyline([-5, -4], [0.5, 0.5], (0, 1, 0, 1))[0]) == 0
+
+
+def test_screen_trace_keeps_each_pixel_columns_extremes():
+    rng = np.random.default_rng(1)
+    n = 200_000
+    x = np.concatenate([np.linspace(-1, 1, n // 2), np.linspace(1, -1, n // 2)])
+    y = np.sin(3 * x) * 50 + rng.normal(0, 2, n)
+    y[12_345] = 400.0
+    y[150_000] = -400.0
+    pixel = (2.2 / 1000, 900 / 600)
+
+    sx, sy, connect = screen_trace(x, y, (-1.1, 1.1, -450, 450), pixel)
+
+    assert len(sx) < n / 10
+    assert sy.max() == 400.0 and sy.min() == -400.0
+    # Every pixel column the trace crosses keeps its lowest and highest point.
+    cols = np.floor((x + 1.1) / pixel[0])
+    scols = np.floor((sx + 1.1) / pixel[0])
+    for c in rng.choice(np.unique(cols), 50, replace=False):
+        assert sy[scols == c].max() == y[cols == c].max()
+        assert sy[scols == c].min() == y[cols == c].min()
+
+
+def test_screen_trace_stays_within_the_point_budget():
+    rng = np.random.default_rng(2)
+    x = rng.normal(0, 1, 300_000)   # no two neighbours share a column
+    y = rng.normal(0, 1, 300_000)
+
+    sx, _sy, _c = screen_trace(x, y, (-5, 5, -5, 5), (0.001, 0.001), max_points=20_000)
+
+    assert len(sx) <= 20_000
 
 
 def test_store_shares_loads_and_follows_moves(tmp_path):
@@ -190,7 +253,7 @@ def test_added_files_get_a_curve_a_card_and_a_legend_entry(panel):
     assert len(uids) == 2 and set(panel._cards) == set(uids)
     assert _legend_names(panel) == ["a", "b"]
     assert panel.state.selected_uid == uids[-1]   # the last added is selected
-    assert len(panel._drawn[uids[0]].curve.xData) == 2000
+    assert len(panel._drawn[uids[0]].curve.trace_x) == 2000
 
 
 def test_only_the_selected_trace_glows(panel):
@@ -228,7 +291,7 @@ def test_card_edits_change_only_this_window(panel, qapp, workspace):
         ("Ferrocene", 0.25, -5.0, "dot")
     assert _legend_names(panel) == ["Ferrocene"]
     dataset = panel.store.get("a.csv")
-    np.testing.assert_allclose(panel._drawn[a].curve.xData[:3], dataset.potential[:3] + 0.25)
+    np.testing.assert_allclose(panel._drawn[a].curve.trace_x[:3], dataset.potential[:3] + 0.25)
     assert panel._drawn[a].curve.opts["pen"].dashPattern() == [1.0, 2.0]   # as exported
     untouched = other.state.experiment(a2)
     assert (untouched.display_name, untouched.x_offset, untouched.line_style) == ("a", 0.0, "solid")
@@ -247,7 +310,7 @@ def test_range_spin_boxes_slider_and_model_agree(panel):
     assert (exp.range_start, exp.range_end) == (100, 100 + MIN_RANGE_POINTS - 1)
     assert card.slider.values() == (exp.range_start, exp.range_end)
     assert card.end_spin.value() == exp.range_end
-    assert len(panel._drawn[a].curve.xData) == MIN_RANGE_POINTS
+    assert len(panel._drawn[a].curve.trace_x) == MIN_RANGE_POINTS
 
 
 def test_labels_are_listed_drawn_and_hidden_outside_the_range(panel):
@@ -310,6 +373,46 @@ def test_long_traces_are_thinned_for_display(panel, workspace):
     (uid,) = panel.add_files(["long.csv"])
 
     assert len(panel._drawn[uid].curve.xData) <= DISPLAY_POINTS + 16
+
+
+def _paint(panel):
+    panel.plot_widget.grab()   # fits the traces to the view, as a paint does
+
+
+def test_traces_are_fitted_to_the_view_but_fit_view_sees_them_whole(panel, workspace):
+    _write_cv(workspace.root / "long.csv", n=120_000)
+    (uid,) = panel.add_files(["long.csv"])
+    _paint(panel)
+    curve = panel._drawn[uid].curve
+    whole = (curve.trace_x.min(), curve.trace_x.max())
+
+    vb = panel.view_box
+    vb.setRange(xRange=(-0.5, -0.45), yRange=(-5, 5), padding=0)
+    _paint(panel)
+
+    (x0, x1), _y = vb.viewRange()
+    (rx0, rx1, _ry0, _ry1), _pixel = panel._drawn[uid].fitted
+    assert rx0 < x0 and rx1 > x1 and rx1 - rx0 < 2 * (x1 - x0)   # the view and a margin
+    assert len(curve.xData) < 5_000
+    assert curve.xData.min() >= rx0 - 1e-12 and curve.xData.max() <= rx1 + 1e-12
+    panel.fit_view()
+    (fx0, fx1), _y = vb.viewRange()
+    assert fx0 <= whole[0] and fx1 >= whole[1]
+
+
+def test_traces_are_drawn_thin_while_the_view_moves(panel):
+    a, b = panel.add_files(["a.csv", "b.csv"])
+    panel.select(a)
+    curve = panel._drawn[a].curve
+    rest_width = curve.opts["pen"].widthF()
+
+    panel._on_view_moved()
+
+    assert curve.opts["pen"].widthF() == 1 < rest_width
+    assert not panel._drawn[a].glow.isVisible()
+    panel._settle_timer.timeout.emit()
+    assert curve.opts["pen"].widthF() == rest_width
+    assert panel._drawn[a].glow.isVisible()
 
 
 def test_axes_follow_the_figure_style(panel):
@@ -454,16 +557,23 @@ def test_smoothing_from_the_card_smooths_the_trace_and_its_labels(panel):
     card = panel._cards[a]
     dataset = panel.store.get("a.csv")
 
-    card.smooth_spin.setValue(25)
+    combo = card.smoothing.method_combo
+    combo.setCurrentIndex(combo.findData("moving_average"))
+    card.smoothing.window_spin.setValue(25)
     _flush(panel)
 
     smoothed = moving_average(dataset.current, 25)
     assert exp.smoothing_points == 25
-    np.testing.assert_allclose(panel._drawn[a].curve.yData, smoothed)
+    np.testing.assert_allclose(panel._drawn[a].curve.trace_y, smoothed)
     assert panel._drawn[a].labels[0].point[1] == pytest.approx(smoothed[1000])
     assert card.smooth_readout.text().startswith("≈ ") and card.smooth_readout.text().endswith(" mV")
-    card.smooth_spin.setValue(1)
-    assert card.smooth_spin.text() == "Off" and card.smooth_readout.text() == ""
+    combo.setCurrentIndex(combo.findData("savgol"))
+    _flush(panel)
+    from moles.analysis.smoothing import savitzky_golay
+    assert exp.smoothing_method == "savgol"
+    np.testing.assert_allclose(panel._drawn[a].curve.trace_y, savitzky_golay(dataset.current, 25))
+    combo.setCurrentIndex(combo.findData("none"))
+    assert not card.smoothing.window_spin.isEnabled() and card.smooth_readout.text() == ""
 
 
 def _card_order(panel):

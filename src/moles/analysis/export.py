@@ -32,6 +32,7 @@ from .appearance import (
 )
 from .display import every_nth, thin
 from .model import LABEL_MANUAL, LABEL_PEAK, LABEL_SHOULDER, PlotWindowState
+from .smoothing import describe as describe_smoothing
 
 # Size of a figure drawn without a window to copy (height from ``aspect``).
 DEFAULT_WIDTH_IN = 6.5
@@ -284,7 +285,7 @@ def experiment_rows(exp, dataset):
             columns.append(values[sl])
     headers += ["Potential (V)", dataset.current_label]
     columns += [x, y]
-    if exp.smoothing_points > 1:
+    if exp.is_smoothed:
         quantity, unit = dataset.current_label.split(" (")
         headers.append(f"{quantity} unsmoothed ({unit}")
         columns.append(dataset.current[sl] + exp.y_offset)
@@ -362,8 +363,7 @@ def _write_experiment(sheet, exp, dataset, original_paths, bold):
         ("X offset (V)", exp.x_offset),
         ("Y offset (µA)", exp.y_offset),
         ("Data range (points)", f"{exp.range_start} to {exp.range_end} of 0 to {len(dataset) - 1}"),
-        ("Smoothing (moving average)",
-         f"{exp.smoothing_points} points" if exp.smoothing_points > 1 else "off"),
+        ("Smoothing", describe_smoothing(exp.smoothing_method, exp.smoothing_points)),
         ("Shown in the plot", "yes" if exp.visible else "no"),
     ]
     for key, label in (("mV_s", "Scan rate (mV/s)"), ("step_V", "Step (V)"),

@@ -26,7 +26,9 @@ from ...analysis import sessions
 from ...analysis.store import DatasetStore
 from ...analysis.workspace import Workspace, WorkspaceError, file_sha256, is_data_file
 from ...logging_setup import install_qt_message_handler, setup_logging
+from ...settings import apply_interface_scale
 from ..visual_identity import apply_app_icon
+from ..wheel_guard import install_wheel_guard
 from .explorer import DataExplorer, reveal_in_file_manager
 from .plot_area import PlotArea
 
@@ -479,8 +481,10 @@ def main():
     if hasattr(QtCore.Qt, 'AA_UseHighDpiPixmaps'):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.data_analysis")
+    install_wheel_guard(app)
     window = DataAnalysisWindow()
     window.show()
     window.restore_last_workspace()

@@ -12,8 +12,10 @@ Each trace gets a row of controls, whichever kind it is:
   internal standard such as ferrocene. Potential is the x-axis of a
   voltammogram and the y-axis of an OCP trace, so the offset follows it.
 * **Colour** — pick the trace colour.
-* **Smoothing** — moving-average window applied to the measured signal (the
-  current of a voltammogram, the potential of an OCP trace).
+* **Smoothing** — none, rolling average, or Savitzky-Golay over a window of
+  points, applied to the measured signal (the current of a voltammogram, the
+  potential of an OCP trace). New traces start with the default chosen in
+  MOLES Settings.
 * **Data range** — a two-handle slider that plots only a slice of the trace.
 * **Show / Remove** — toggle visibility or drop the trace entirely.
 * **Save edited CSV** — write the currently displayed data (selected range,
@@ -31,6 +33,10 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from ...analysis.smoothing import describe as describe_smoothing
+from ...analysis.smoothing import smooth
+from ...settings import DEFAULT_SMOOTHING, get_electroanalysis_smoothing
+from ..smoothing_control import SmoothingControl
 from .loader import KIND_OCP, KIND_VOLTAMMOGRAM, load_trace
 from .range_slider import RangeSlider
 
@@ -58,7 +64,8 @@ class DatasetRow(QtWidgets.QGroupBox):
 
     def __init__(self, dataset_id, name, x, y, color,
                  y_label='Current (uA)', x_label='Potential (V)',
-                 kind=KIND_VOLTAMMOGRAM, source_path=None):
+                 kind=KIND_VOLTAMMOGRAM, source_path=None,
+                 smoothing=DEFAULT_SMOOTHING):
         super().__init__()
         self.dataset_id = dataset_id
         self.name = name
@@ -122,12 +129,9 @@ class DatasetRow(QtWidgets.QGroupBox):
         # Smoothing.
         row2 = QtWidgets.QHBoxLayout()
         row2.addWidget(QtWidgets.QLabel("Smoothing:"))
-        self.smooth_spin = QtWidgets.QSpinBox()
-        self.smooth_spin.setRange(1, 100)
-        self.smooth_spin.setValue(1)
-        self.smooth_spin.setSuffix(" pts")
-        self.smooth_spin.valueChanged.connect(self._emit_changed)
-        row2.addWidget(self.smooth_spin)
+        self.smoothing = SmoothingControl(*smoothing)
+        self.smoothing.changed.connect(self._emit_changed)
+        row2.addWidget(self.smoothing, stretch=1)
         layout.addLayout(row2)
 
         # Data range slider.
@@ -180,10 +184,7 @@ class DatasetRow(QtWidgets.QGroupBox):
         else:
             x = x - offset
 
-        window = self.smooth_spin.value()
-        if window > 1 and len(y) > window:
-            kernel = np.ones(window) / window
-            y = np.convolve(y, kernel, mode='same')
+        y = smooth(y, *self.smoothing.value())
 
         low, high = self.range_slider.values()
         sl = slice(low, high + 1)
@@ -230,7 +231,7 @@ class DatasetRow(QtWidgets.QGroupBox):
             f"Edited copy of: {source}",
             f"Trace name: {self.name}",
             f"Offset applied (V): {self.offset_spin.value():.3f}",
-            f"Smoothing (moving-average window, points): {self.smooth_spin.value()}",
+            f"Smoothing: {describe_smoothing(*self.smoothing.value())}",
             f"Selected point range (indices): {low} to {high} of 0 to {last_index}",
             f"Points exported: {len(exported_x)}",
             "Potential window after offset (V): "
@@ -405,7 +406,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._color_index += 1
 
         row = DatasetRow(dataset_id, name, x, y, color, y_label=y_label,
-                         x_label=x_label, kind=kind, source_path=source_path)
+                         x_label=x_label, kind=kind, source_path=source_path,
+                         smoothing=get_electroanalysis_smoothing())
         row.changed.connect(self._schedule_render)
         row.remove_requested.connect(self._remove_dataset)
         self._row_layout.insertWidget(self._row_layout.count() - 1, row)

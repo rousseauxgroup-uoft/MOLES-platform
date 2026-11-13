@@ -178,3 +178,103 @@ def test_every_app_including_data_analysis_can_be_launched():
     assert dict(APPS)["Data Analysis"] == "moles.ui.data_analysis"
     for _label, module in APPS:
         assert importlib.util.find_spec(module + ".__main__") is not None
+
+
+def test_every_app_has_an_icon_tile_that_launches_it(launcher, monkeypatch):
+    from moles.ui.launcher import main_window as launcher_mod
+    from moles.ui.visual_identity import APP_ICONS, load_resource_pixmap
+
+    started = []
+    monkeypatch.setattr(launcher_mod, "launch_detached", started.append)
+
+    assert list(launcher.app_tiles) == [module for _label, module in launcher_mod.APPS]
+    for module, tile in launcher.app_tiles.items():
+        icon = load_resource_pixmap(APP_ICONS[module])
+        assert not icon.isNull(), f"{APP_ICONS[module]} is missing"
+        assert tile._icon.toImage() == icon.toImage()
+        tile.click()
+    assert started == [module for _label, module in launcher_mod.APPS]
+    assert launcher.app_tiles["moles.ui.electroanalysis"].text() == "Electroanalysis"
+
+
+def test_the_logo_is_level_with_the_middle_of_the_app_icons(launcher, qapp):
+    from PyQt5 import QtCore
+    from moles.ui.launcher.main_window import APP_ICON_PX, APP_ICON_TOP_PX
+
+    launcher.show()
+    qapp.processEvents()
+    central = launcher.centralWidget()
+    logo = launcher._logo_label
+    pix = logo.pixmap()
+    logo_mid = (logo.mapTo(central, QtCore.QPoint(0, 0)).y()
+                + logo.contentsMargins().top()
+                + pix.height() / pix.devicePixelRatio() / 2)
+    for tile in launcher.app_tiles.values():
+        icon_mid = tile.mapTo(central, QtCore.QPoint(0, APP_ICON_TOP_PX + APP_ICON_PX // 2)).y()
+        assert abs(logo_mid - icon_mid) <= 1
+
+
+def test_an_app_tile_rings_its_icon_when_highlighted(qapp):
+    from PyQt5 import QtGui
+    from moles.ui.launcher.main_window import APP_RING_COLOR, AppTile
+    from moles.ui.visual_identity import load_app_icon_pixmap
+
+    tile = AppTile("Settings", load_app_icon_pixmap("moles.ui.settings"))
+    ring_color = QtGui.QColor(APP_RING_COLOR).rgb()
+
+    def ring_pixels():
+        image = tile.grab().toImage()
+        return sum(image.pixel(x, y) == ring_color
+                   for x in range(image.width()) for y in range(image.height()))
+
+    assert ring_pixels() == 0
+    tile._highlighted = lambda: True
+    assert ring_pixels() > 200
+
+
+def test_each_app_shows_its_launcher_icon_as_its_own_icon(qapp, monkeypatch):
+    """Every app's main() names its package, so its Dock / taskbar icon is its
+    launcher button's picture, and each has its own Windows taskbar ID."""
+    import inspect
+    import importlib
+    from moles.ui import visual_identity
+    from moles.ui.launcher.main_window import APPS
+
+    packages = [module for _label, module in APPS] + [visual_identity.LAUNCHER]
+    assert set(visual_identity.APP_ICONS) == set(packages)
+    assert set(visual_identity.APP_USER_MODEL_IDS) == set(packages)
+    assert len(set(visual_identity.APP_USER_MODEL_IDS.values())) == len(packages)
+    entry = {"moles.ui.settings": "moles.ui.settings.dialog"}
+    for package in packages:
+        module = importlib.import_module(entry.get(package, f"{package}.main_window"))
+        assert f'apply_app_icon(app, "{package}")' in inspect.getsource(module.main)
+
+    class App:
+        icon = None
+
+        def setWindowIcon(self, icon):
+            self.icon = icon
+
+    app = App()
+    visual_identity.apply_app_icon(app, "moles.ui.electrolysis")
+    expected = visual_identity.load_resource_pixmap("launcher_electrolysis.png")
+    assert app.icon.pixmap(expected.size()).toImage() == expected.toImage()
+
+
+def test_windows_gets_each_apps_taskbar_id(monkeypatch):
+    import ctypes
+    from moles.ui import visual_identity
+
+    seen = []
+
+    class Shell32:
+        def SetCurrentProcessExplicitAppUserModelID(self, app_id):
+            seen.append(app_id)
+
+    class WinDLL:
+        shell32 = Shell32()
+
+    monkeypatch.setattr(visual_identity.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", WinDLL(), raising=False)
+    visual_identity._set_windows_app_id("moles.ui.data_analysis")
+    assert seen == ["MOLES.Platform.DataAnalysis"]

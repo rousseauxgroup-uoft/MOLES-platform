@@ -26,7 +26,8 @@ from ...calibration import load_calibrations
 from ...logging_setup import LOG_DIR
 from ...driver.mock import MockLivePotentiostat, MockPotentiostat
 from ...driver.ps4_ref import (DEFAULT_QUIET_S, FW_FEATURE_IR_COMP, IR_MAX_FRACTION,
-                                RANGE_LABELS, Potentiostat, SwitchState)
+                                RANGE_LABELS, VOLTAGE_WARN_THRESHOLD_V, Potentiostat,
+                                SwitchState)
 from ...methods.cv import ExperimentStopped, LivePotentiostat
 from ...methods.dpv import (applied_dpv_settings, build_dpv_waveform,
                             cyclic_sweeps, process_dpv, samples_per_segment)
@@ -70,6 +71,62 @@ IR_EXTRA_COLUMNS = "Potential measured (V),iR drop subtracted (V)"
 # on, 0 (+/-50 mA) to 4 (+/-5 uA). The name must not match the loader's
 # 'potential'/'current' keywords.
 RANGE_COLUMN = "Range"
+
+# The CV and DPV potentials that can be entered relative to the open-circuit
+# potential instead of the reference electrode. Pulse and step heights are
+# differences, so they never shift.
+OCP_RELATIVE_KEYS = ('start_V', 'min_V', 'max_V', 'last_V', 'end_V')
+
+# Readings combined into the OCP a run is referenced to. One reading carries a
+# few mV of noise, which would shift the whole scan; the median of several
+# does not.
+OCP_READS = 5
+
+
+def potentials_beyond_compliance(params):
+    """Return the requested potentials this run cannot physically reach.
+
+    Collects the extreme potentials the waveform will ask for (for DPV the
+    pulse rides on top of the staircase in the scan direction, so the pulsed
+    points sit beyond the plain sweep limits) and returns those beyond the
+    warning threshold.
+    """
+    if params.get('method') == 'OCP':
+        return []  # nothing is driven: the cell stays disconnected throughout
+    if params.get('method') == 'DPV':
+        pulse = abs(params.get('pulse_V', 0.0))
+        if params.get('dpv_type') == 'cyclic':
+            lo = params.get('min_V', 0.0)
+            hi = params.get('max_V', 0.0)
+            # Pulses push past the window: up at the top, down at the bottom.
+            # Start/End V can sit outside the vertices, so include them too.
+            extremes = [lo, hi, hi + pulse, lo - pulse,
+                        params.get('start_V', 0.0), params.get('end_V', 0.0)]
+        else:
+            start = params.get('start_V', 0.0)
+            end = params.get('end_V', 0.0)
+            # The pulse rides in the scan direction, so the far end is pushed
+            # further out than End V itself.
+            direction = 1.0 if end >= start else -1.0
+            extremes = [start, end, end + direction * pulse]
+    else:
+        extremes = [params.get(k, 0.0) for k in ('start_V', 'min_V', 'max_V', 'last_V')]
+    return sorted({v for v in extremes if abs(v) > VOLTAGE_WARN_THRESHOLD_V})
+
+
+def reference_to_ocp(params, ocp_V):
+    """Turn potentials entered vs OCP into the potentials vs the reference
+    electrode that the run drives.
+
+    Everything downstream (waveform, iR compensation, saved columns) then works
+    in absolute potentials as usual. The values as entered are kept under
+    ``<key>_vs_ocp`` so the params file shows both.
+    """
+    for key in OCP_RELATIVE_KEYS:
+        if key in params:
+            params[f'{key}_vs_ocp'] = params[key]
+            params[key] = round(params[key] + ocp_V, 4)
+    return params
 
 
 def combine_ru_repeats(results, max_spread=RU_MAX_SPREAD):
@@ -399,12 +456,20 @@ class VoltammetryWorker(QtCore.QRunnable):
             # An OCP run never closes it at all — that is the measurement.
 
             method = self.params.get('method', 'CV')
+            vs_ocp = method in ('CV', 'DPV') and bool(self.params.get('vs_ocp'))
             try:
-                ocp = float(self.ps.read_ocp())
+                ocp = self._measure_ocp()
                 if method in ('CV', 'DPV'):
                     self.params['ocp_V'] = round(ocp, 4)
-            except Exception:
-                pass
+            except Exception as e:
+                # Without the OCP a relative run has nothing to stand on
+                if vs_ocp:
+                    raise RuntimeError(
+                        "Could not measure the open-circuit potential this "
+                        f"run's potentials are relative to ({e}). Nothing "
+                        "was applied to the cell.") from e
+            if vs_ocp:
+                self._reference_to_ocp(self.params['ocp_V'])
 
             if method in ('CV', 'DPV'):
                 # Before the tare below, so the zero is taken on the range the
@@ -456,6 +521,32 @@ class VoltammetryWorker(QtCore.QRunnable):
             # Only after the port is closed is the board safe for another app.
             if claim_key is not None:
                 claims.release(claim_key)
+
+    def _measure_ocp(self):
+        """The cell's open-circuit potential, as the median of a few readings.
+        Leaves the cell disconnected."""
+        readings = [float(self.ps.read_ocp(restore_switch_state=False))]
+        for _ in range(OCP_READS - 1):
+            readings.append(float(self.ps.read_potential_calibrated()[0]))
+        return float(np.median(readings))
+
+    def _reference_to_ocp(self, ocp_V):
+        """Shift this run's potentials from vs OCP to vs the reference
+        electrode, refusing the run if that takes them past the output limit.
+
+        The form's own limit check could only see the values as entered, so
+        this is the first point the real potentials are known.
+        """
+        reference_to_ocp(self.params, ocp_V)
+        offenders = potentials_beyond_compliance(self.params)
+        if offenders:
+            listed = ", ".join(f"{v:+.2f} V" for v in offenders)
+            raise ValueError(
+                f"Relative to the measured OCP ({ocp_V:+.3f} V), this run asks "
+                f"for {listed} vs the reference, beyond what the potentiostat "
+                f"can drive. Nothing was applied to the cell.")
+        self.signals.status.emit(
+            self.pot_id, f"OCP {ocp_V:+.3f} V — potentials set relative to it")
 
     # ------------------------------------------------------------------
     # Method runners

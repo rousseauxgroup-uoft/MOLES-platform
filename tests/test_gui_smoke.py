@@ -13,7 +13,7 @@ import pytest
 
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
-    # Redirect saved data into the test's temp folder, not the user's Dropbox.
+    # Redirect saved data into the test's temp folder, not the user's data folder.
     # Data folders now come from moles.settings via get_cv_data_folder(), so we
     # override that getter in the worker module rather than a module constant.
     import moles.ui.electroanalysis.control_tab as control_tab

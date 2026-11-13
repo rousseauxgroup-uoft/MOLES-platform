@@ -15,7 +15,10 @@ from PyQt5 import QtCore, QtWidgets
 from .analysis_tab import AnalysisTab
 from .control_tab import ControlTab
 from ..visual_identity import apply_app_icon
+from ..settings.data_folder_prompt import ensure_data_folders
+from ..wheel_guard import install_wheel_guard
 from ...logging_setup import install_qt_message_handler, setup_logging
+from ...settings import apply_interface_scale
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -59,10 +62,16 @@ def main():
     if hasattr(QtCore.Qt, 'AA_UseHighDpiPixmaps'):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
-    apply_app_icon(app)
+    apply_app_icon(app, "moles.ui.electroanalysis")
+    install_wheel_guard(app)
     window = MainWindow()
     window.show()
+    # Ask where to save data if no folder is set yet (new install, or an
+    # upgrade from a version that defaulted to Dropbox). Queued so the
+    # prompt opens over the window rather than before it.
+    QtCore.QTimer.singleShot(0, lambda: ensure_data_folders(window))
     sys.exit(app.exec_())
 
 
