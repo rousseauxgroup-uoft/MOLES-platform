@@ -9,7 +9,8 @@ optionally view the first derivative.
 Each loaded run gets a row of per-trace controls:
 
 * **Colour** — pick the trace colour (shared by all of that run's metrics).
-* **Smoothing** — moving-average window applied to every metric.
+* **Smoothing** — none, rolling average, or Savitzky-Golay over a window of
+  points, applied to every metric.
 * **Data range** — a two-handle slider that plots only a slice of the run.
 * **Show / Remove** — toggle visibility or drop the run entirely.
 
@@ -27,7 +28,10 @@ import pandas as pd
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from ...analysis.smoothing import smooth
+from ...settings import DEFAULT_SMOOTHING
 from ..electroanalysis.range_slider import RangeSlider
+from ..smoothing_control import SmoothingControl
 
 # Faraday constant (C/mol), used to convert charge passed into F/mol.
 _FARADAY = 96485
@@ -204,12 +208,9 @@ class DatasetRow(QtWidgets.QGroupBox):
         row1.addWidget(self.color_btn)
 
         row1.addWidget(QtWidgets.QLabel("Smoothing:"))
-        self.smooth_spin = QtWidgets.QSpinBox()
-        self.smooth_spin.setRange(1, 100)
-        self.smooth_spin.setValue(1)
-        self.smooth_spin.setSuffix(" pts")
-        self.smooth_spin.valueChanged.connect(self._emit_changed)
-        row1.addWidget(self.smooth_spin)
+        self.smoothing = SmoothingControl(*DEFAULT_SMOOTHING)
+        self.smoothing.changed.connect(self._emit_changed)
+        row1.addWidget(self.smoothing, stretch=1)
         layout.addLayout(row1)
 
         # Substrate loading for this run — read from the file's metadata when
@@ -286,10 +287,10 @@ class DatasetRow(QtWidgets.QGroupBox):
         if not self.visible_cb.isChecked():
             return {}
 
-        window = self.smooth_spin.value()
-        key = (x_mode, round(self.mmol_spin.value(), 6), window, bool(derivative))
+        smoothing = self.smoothing.value()
+        key = (x_mode, round(self.mmol_spin.value(), 6), smoothing, bool(derivative))
         if key != self._cache_key:
-            self._cache = self._compute_full(x_mode, derivative, window)
+            self._cache = self._compute_full(x_mode, derivative, smoothing)
             self._cache_key = key
         if self._cache is None:
             return {}
@@ -303,7 +304,7 @@ class DatasetRow(QtWidgets.QGroupBox):
             out[metric] = (x_full[sl], y_full[sl])
         return out
 
-    def _compute_full(self, x_mode, derivative, window):
+    def _compute_full(self, x_mode, derivative, smoothing):
         """Process every metric over the full run (no range slice) for the given
         options. Returns ``{metric: (x, y)}``, or ``None`` if the x-axis (e.g.
         charge with no valid loading) cannot be built."""
@@ -312,10 +313,7 @@ class DatasetRow(QtWidgets.QGroupBox):
             return None
         result = {}
         for metric, y_full in self.metrics.items():
-            y = y_full
-            if window > 1 and len(y) > window:
-                kernel = np.ones(window) / window
-                y = np.convolve(y, kernel, mode='same')
+            y = smooth(y_full, *smoothing)
             x = x_full
             if derivative:
                 dx = np.gradient(x)

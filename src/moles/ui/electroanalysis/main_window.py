@@ -18,6 +18,7 @@ from ..visual_identity import apply_app_icon
 from ..settings.data_folder_prompt import ensure_data_folders
 from ..wheel_guard import install_wheel_guard
 from ...logging_setup import install_qt_message_handler, setup_logging
+from ...settings import apply_interface_scale
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -61,6 +62,7 @@ def main():
     if hasattr(QtCore.Qt, 'AA_UseHighDpiPixmaps'):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app, "moles.ui.electroanalysis")
     install_wheel_guard(app)

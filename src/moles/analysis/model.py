@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .smoothing import smoothed_current
+from .smoothing import METHOD_MOVING_AVERAGE, METHODS, is_smoothing, smoothed_current
 
 LABEL_PEAK = "peak"
 LABEL_SHOULDER = "shoulder"
@@ -131,7 +131,8 @@ class ExperimentView:
     y_offset: float = 0.0  # µA
     color: str = COLOR_CYCLE[0]
     line_style: str = "solid"
-    smoothing_points: int = 1  # moving-average window; 1 = off
+    smoothing_points: int = 1  # smoothing window (points)
+    smoothing_method: str = METHOD_MOVING_AVERAGE  # see analysis.smoothing.METHODS
     visible: bool = True
     range_start: int = 0
     range_end: int = -1
@@ -168,9 +169,14 @@ class ExperimentView:
 
     # --- Displayed values ---
 
+    @property
+    def is_smoothed(self):
+        """True when the chosen smoothing changes the trace at all."""
+        return is_smoothing(self.smoothing_method, self.smoothing_points)
+
     def current(self, dataset):
         """The whole file's current (µA) as this experiment shows it: smoothed, before offsets."""
-        return smoothed_current(dataset, self.smoothing_points)
+        return smoothed_current(dataset, self.smoothing_points, self.smoothing_method)
 
     def displayed_arrays(self, dataset):
         """``(indices, x, y)`` of the points inside the data range, smoothing and offsets applied."""
@@ -226,6 +232,7 @@ class ExperimentView:
             "x_offset": self.x_offset, "y_offset": self.y_offset,
             "color": self.color, "line_style": self.line_style,
             "smoothing_points": self.smoothing_points,
+            "smoothing_method": self.smoothing_method,
             "visible": self.visible,
             "range": [self.range_start, self.range_end],
             "labels": [lp.to_dict() for lp in self.labels],
@@ -241,6 +248,10 @@ class ExperimentView:
             color=d.get("color", COLOR_CYCLE[0]),
             line_style=d.get("line_style", "solid"),
             smoothing_points=int(d.get("smoothing_points", 1)),
+            # Sessions saved before the method choice only had a moving average.
+            smoothing_method=(d.get("smoothing_method")
+                              if d.get("smoothing_method") in METHODS
+                              else METHOD_MOVING_AVERAGE),
             visible=bool(d.get("visible", True)),
             range_start=int(start), range_end=int(end),
             labels=[LabelledPoint.from_dict(x) for x in d.get("labels", [])],
@@ -364,10 +375,15 @@ class PlotWindowState:
             n += 1
         return f"{name} ({n})"
 
-    def add_experiment(self, dataset, file):
-        """Add a view of ``dataset`` with the next free colour and a unique name."""
+    def add_experiment(self, dataset, file, smoothing=None):
+        """Add a view of ``dataset`` with the next free colour and a unique name.
+
+        ``smoothing`` is an optional ``(method, window)`` the view starts with.
+        """
         exp = ExperimentView.for_dataset(dataset, file, color=self.next_color(),
                                          display_name=self.unique_name(dataset.name))
+        if smoothing is not None:
+            exp.smoothing_method, exp.smoothing_points = smoothing[0], int(smoothing[1])
         self.experiments.append(exp)
         return exp
 

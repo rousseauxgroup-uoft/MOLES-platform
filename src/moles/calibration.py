@@ -20,9 +20,10 @@ always imported (``POTENTIOSTAT_CALIBRATIONS``, ``POTENTIOSTAT_PORTS``,
 """
 
 import csv
+import os
 import platform
 from importlib.resources import files
-from typing import Dict
+from typing import Dict, Iterable, Set
 
 from .onboarding.registry import USER_REGISTRY_PATH, load_registry
 
@@ -194,6 +195,22 @@ def get_potentiostat_ports() -> Dict[str, str]:
         if ports:
             return ports
     return _legacy_os_ports()
+
+
+def connected_ports(ports: Iterable[str]) -> Set[str]:
+    """Return the members of ``ports`` whose device is plugged in right now.
+
+    No port is opened, so this never disturbs a board another MOLES app is
+    using. On macOS and Linux a USB serial device's path exists only while it
+    is attached; Windows keeps no such file, so its COM ports are compared
+    against the ones the OS currently reports.
+    """
+    ports = [p for p in ports if p]
+    if os.name == "nt":
+        from serial.tools import list_ports
+        live = {info.device.upper() for info in list_ports.comports()}
+        return {p for p in ports if p.upper() in live}
+    return {p for p in ports if os.path.exists(p)}
 
 
 # Loaded once on import so other modules can read these as plain dicts.

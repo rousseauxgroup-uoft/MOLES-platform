@@ -9,6 +9,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ...analysis.datasets import branch_spans
 from ...analysis.model import LABEL_SHOULDER, LINE_STYLES
+from ..smoothing_control import SmoothingControl
 from .range_slider import IndexRangeSlider
 
 # What a change touches, so the plot redraws only what it must.
@@ -141,19 +142,14 @@ class ExperimentCard(QtWidgets.QFrame):
         grid.addWidget(self.style_combo, 1, 3)
 
         grid.addWidget(QtWidgets.QLabel("Smoothing"), 2, 0)
-        self.smooth_spin = QtWidgets.QSpinBox()
-        self.smooth_spin.setRange(1, 200)
-        self.smooth_spin.setSuffix(" pts")
-        self.smooth_spin.setSpecialValueText("Off")
-        self.smooth_spin.setKeyboardTracking(False)
-        self.smooth_spin.setToolTip(
-            "Moving average over this many points, centred on each point.\n"
+        self.smoothing = SmoothingControl(max_window=200, keyboard_tracking=False)
+        self.smoothing.setToolTip(
             "Smooths the plotted trace, its labels, Box Pick and the export.")
-        self.smooth_spin.valueChanged.connect(self._on_smoothing)
-        grid.addWidget(self.smooth_spin, 2, 1)
+        self.smoothing.changed.connect(self._on_smoothing)
+        grid.addWidget(self.smoothing, 2, 1, 1, 2)
         self.smooth_readout = QtWidgets.QLabel()
         self.smooth_readout.setStyleSheet("color: gray;")
-        grid.addWidget(self.smooth_readout, 2, 2, 1, 2)
+        grid.addWidget(self.smooth_readout, 2, 3)
         self._volts_per_point = _volts_per_point(dataset)
 
         grid.addWidget(QtWidgets.QLabel("Data range (points)"), 3, 0, 1, 4)
@@ -197,7 +193,7 @@ class ExperimentCard(QtWidgets.QFrame):
         """Show the experiment's current settings without reporting them as edits."""
         exp = self.exp
         widgets = (self.visible_cb, self.name_edit, self.x_spin, self.y_spin,
-                   self.style_combo, self.smooth_spin, self.start_spin, self.end_spin)
+                   self.style_combo, self.start_spin, self.end_spin)
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -207,7 +203,7 @@ class ExperimentCard(QtWidgets.QFrame):
             self.x_spin.setValue(exp.x_offset)
             self.y_spin.setValue(exp.y_offset)
             self.style_combo.setCurrentIndex(max(0, self.style_combo.findData(exp.line_style)))
-            self.smooth_spin.setValue(exp.smoothing_points)
+            self.smoothing.set_value(exp.smoothing_method, exp.smoothing_points)
             self.start_spin.setValue(exp.range_start)
             self.end_spin.setValue(exp.range_end)
         finally:
@@ -239,7 +235,7 @@ class ExperimentCard(QtWidgets.QFrame):
 
     def _refresh_smoothing_readout(self):
         points = self.exp.smoothing_points
-        if points <= 1 or not self._volts_per_point:
+        if not self.exp.is_smoothed or not self._volts_per_point:
             self.smooth_readout.setText("")
         else:
             self.smooth_readout.setText(f"≈ {points * self._volts_per_point * 1000:.1f} mV")
@@ -309,7 +305,8 @@ class ExperimentCard(QtWidgets.QFrame):
         self.refresh_labels()
         self.changed.emit(self.exp.uid, CHANGED_DATA)
 
-    def _on_smoothing(self, points):
+    def _on_smoothing(self, method, points):
+        self.exp.smoothing_method = method
         self.exp.smoothing_points = points
         self._refresh_smoothing_readout()
         self.refresh_labels()

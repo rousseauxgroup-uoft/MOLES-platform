@@ -390,7 +390,9 @@ def test_box_pick_works_on_the_smoothed_trace(panel):
     from moles.analysis.smoothing import moving_average
     (a,) = panel.add_files(["a.csv"])
     exp = panel.state.experiment(a)
-    panel._cards[a].smooth_spin.setValue(51)
+    panel._cards[a].smoothing.method_combo.setCurrentIndex(
+        panel._cards[a].smoothing.method_combo.findData("moving_average"))
+    panel._cards[a].smoothing.window_spin.setValue(51)
     smoothed = moving_average(panel._datasets[a].current, 51)
 
     panel.pick_in_box(_box(0.1, 0.5, 20, 60))

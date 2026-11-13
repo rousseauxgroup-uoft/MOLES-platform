@@ -22,7 +22,7 @@ from ... import claims
 from ..visual_identity import apply_app_icon
 from ..settings.data_folder_prompt import ensure_data_folders
 from ..wheel_guard import install_wheel_guard
-from ...calibration import POTENTIOSTAT_CALIBRATIONS, get_potentiostat_ports
+from ...calibration import POTENTIOSTAT_CALIBRATIONS, connected_ports, get_potentiostat_ports
 from ...data_io import calculate_total_charge
 from ...driver.mock import MockPotentiostat
 from ...driver.ps4_ref import (
@@ -32,7 +32,8 @@ from ...driver.ps4_ref import (
 )
 from ...logging_setup import install_qt_message_handler, setup_logging
 from ...session import connect_with_retry, emergency_cleanup
-from ...settings import get_show_electrolysis_plot_after_run
+from ...settings import (apply_interface_scale, get_show_electrolysis_plot_after_run,
+                         get_show_unconnected_potentiostats)
 from .guardian import Guardian
 from .table import (
     ALL_METHOD_COLS,
@@ -124,6 +125,9 @@ HEARTBEAT_MS = 1000
 # How often idle rows re-check the cross-process claim files to show which
 # boards other MOLES apps are currently using.
 CLAIMS_POLL_MS = 3000
+
+# Status shown on the row of a registered board that is not plugged in.
+NOT_CONNECTED = "Not connected"
 
 
 class GuardianSignals(QtCore.QObject):
@@ -605,6 +609,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # app is open show up without a restart.
         ports = get_potentiostat_ports()
 
+        # Registered boards that are not plugged in are listed (greyed out)
+        # only if the user asked for that in MOLES Settings.
+        present = connected_ports(ports.values())
+        unplugged = {pid for pid, port in ports.items() if port not in present}
+        hidden = 0
+        if not get_show_unconnected_potentiostats():
+            hidden = len(unplugged)
+            ports = {pid: port for pid, port in ports.items() if pid not in unplugged}
+            unplugged = set()
+
         for pid, port in ports.items():
             ps = Potentiostat(serial_port=port)
             # Calibration lives on the Python object, not the hardware, so it
@@ -621,14 +635,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ports[pid] = port
             self._claim_keys[pid] = claims.claim_key_for(pid, port)
             self.add_ps_ui(pid)
-            logger.info("Listed board %s on %s", pid, port)
+            logger.info("Listed board %s on %s%s", pid, port,
+                        " (not plugged in)" if pid in unplugged else "")
 
         board_count = len(ports)
-        if board_count == 0:
+        hidden_note = (f" {hidden} registered board(s) not plugged in are hidden "
+                       "(see MOLES Settings)." if hidden else "")
+        if board_count == 0 and hidden:
+            self.status_label.setText("No potentiostats plugged in." + hidden_note)
+        elif board_count == 0:
             self.status_label.setText("No potentiostats registered — run moles-onboard.")
         else:
             self.status_label.setText(
                 f"{board_count} board(s) listed. Ports open when an experiment starts."
+                + hidden_note
             )
         self._size_table_columns()
         self._refresh_claim_statuses()
@@ -665,12 +685,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ps_table.setColumnWidth(col, needed)
 
     def _refresh_claim_statuses(self):
-        """Show which idle boards other MOLES apps are using right now.
+        """Show which idle boards are unplugged or in use by other MOLES apps.
 
-        Only rows whose status is "Idle" or a previous "In use ..." are
-        touched — experiment outcomes (Completed / Stopped / Error) stay
-        visible until the user clears or restarts the row.
+        Only rows whose status is "Idle", "Not connected" or a previous
+        "In use ..." are touched — experiment outcomes (Completed / Stopped /
+        Error) stay visible until the user clears or restarts the row.
         """
+        present = connected_ports(self._ports[pid] for pid in self._claim_keys
+                                  if pid in self._ports)
         for r in range(self.ps_table.rowCount()):
             pid = self._row_pid(r)
             if pid is None or pid in self.workers or pid in self._pending_starts:
@@ -682,20 +704,24 @@ class MainWindow(QtWidgets.QMainWindow):
             if item is None:
                 continue
             current = item.text()
-            if current != "Idle" and not current.startswith("In use"):
+            if current not in ("Idle", NOT_CONNECTED) and not current.startswith("In use"):
                 continue
-            claim = claims.read_claim(key)
-            busy = claim is not None and not claims.is_stale(claim)
-            new_text = f"In use — {claim.describe()}" if busy else "Idle"
+            if self._ports.get(pid) not in present:
+                new_text, color = NOT_CONNECTED, QtCore.Qt.gray
+                tooltip = "This board is registered but not plugged in."
+            else:
+                claim = claims.read_claim(key)
+                busy = claim is not None and not claims.is_stale(claim)
+                new_text = f"In use — {claim.describe()}" if busy else "Idle"
+                color = QtCore.Qt.darkYellow if busy else QtCore.Qt.black
+                tooltip = new_text if busy else ""
             if new_text == current:
                 continue
             self._suppress_item_changed = True
             try:
                 item.setText(new_text)
-                item.setForeground(
-                    QtGui.QBrush(QtCore.Qt.darkYellow if busy else QtCore.Qt.black)
-                )
-                item.setToolTip(new_text if busy else "")
+                item.setForeground(QtGui.QBrush(color))
+                item.setToolTip(tooltip)
             finally:
                 self._suppress_item_changed = False
 
@@ -1504,14 +1530,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("No potentiostats checked.")
             return
         to_start = []
+        unplugged = []
+        present = connected_ports(self._ports.get(self._row_pid(r)) for r in rows)
         for r in rows:
             pid = self._row_pid(r)
             if pid is None or pid in self.workers or pid in self._pending_starts:
                 continue
+            # Mock boards have no claim key and are always present.
+            if pid in self._claim_keys and self._ports.get(pid) not in present:
+                unplugged.append(pid)
+                continue
             to_start.append(r)
             self._pending_starts.add(pid)
+        if unplugged:
+            self._refresh_claim_statuses()
         if not to_start:
-            self.status_label.setText("Checked potentiostats are already running.")
+            if unplugged:
+                self.status_label.setText(
+                    f"Not plugged in: PS {', '.join(map(str, unplugged))}. "
+                    "Connect the board(s) and try again.")
+            else:
+                self.status_label.setText("Checked potentiostats are already running.")
             return
 
         # Warn once (for the whole batch) about potential setpoints beyond the
@@ -1549,6 +1588,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(i * 200, lambda r=row: self._start_row(r))
         self.status_label.setText(
             f"Starting {len(to_start)} experiment(s) (200 ms stagger)..."
+            + (f" Skipped, not plugged in: PS {', '.join(map(str, unplugged))}."
+               if unplugged else "")
         )
 
     def _start_row(self, row):
@@ -2112,6 +2153,7 @@ def main():
     setup_logging("electrolysis")
     install_qt_message_handler()
 
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app, "moles.ui.electrolysis")
     install_wheel_guard(app)

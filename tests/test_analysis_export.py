@@ -235,7 +235,7 @@ def test_a_smoothed_experiment_exports_both_currents(tmp_path, window_state):
     rows = _read_xlsx(tmp_path / "out.xlsx")[0]["NiBr2(bpy)"]
 
     details = {r[0]: r[1] for r in rows if len(r) == 2}
-    assert details["Smoothing (moving average)"] == "9 points"
+    assert details["Smoothing"] == "rolling average, 9 points"
     header = next(i for i, r in enumerate(rows) if r and r[0] == "Point")
     assert rows[header][-2:] == ["Current (µA)", "Current unsmoothed (µA)"]
     first = rows[header + 1]

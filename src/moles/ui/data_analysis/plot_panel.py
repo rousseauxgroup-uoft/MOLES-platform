@@ -55,6 +55,7 @@ from ...analysis.model import LABEL_MANUAL, LabelledPoint
 from ...analysis.peaks import detect_in_box
 from ...analysis.sessions import resolve
 from ...analysis.workspace import WorkspaceError
+from ...settings import get_electroanalysis_smoothing
 from .experiment_card import (
     CHANGED_DATA, CHANGED_LABELS, CHANGED_NAME, CHANGED_STYLE, ExperimentCard, MissingCard,
 )
@@ -465,7 +466,9 @@ class PlotPanel(QtWidgets.QWidget):
             except (UnsupportedDataError, WorkspaceError, OSError, ValueError) as e:
                 failed.append(f"{rel}: {e}")
                 continue
-            exp = self.state.add_experiment(dataset, rel)
+            # New experiments start with the default smoothing from MOLES Settings.
+            exp = self.state.add_experiment(dataset, rel,
+                                            smoothing=get_electroanalysis_smoothing())
             self._attach(exp, dataset)
             added.append(exp.uid)
         if failed:

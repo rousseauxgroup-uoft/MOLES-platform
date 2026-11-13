@@ -1,8 +1,9 @@
 """Settings dialog for the ``moles-settings`` command.
 
 A small standalone window that lets the user pick where experimental data
-is saved and toggle whether the electrolysis plot pops up after a run. The
-values are read from and written to ``moles.settings``; nothing else in
+is saved, toggle whether the electrolysis plot pops up after a run, scale the
+interface, choose whether unplugged potentiostats are listed, and set the
+smoothing new electroanalysis traces start with. The values are read from and written to ``moles.settings``; nothing else in
 this module persists state of its own.
 """
 
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
 
+from ..smoothing_control import SmoothingControl
 from ..visual_identity import apply_app_icon
 from ..wheel_guard import install_wheel_guard
 
@@ -20,13 +22,23 @@ from ..wheel_guard import install_wheel_guard
 from ...settings import (
     DEFAULT_CV_DATA_FOLDER,
     DEFAULT_DATA_FOLDER,
+    DEFAULT_INTERFACE_SCALE,
+    INTERFACE_SCALE_CHOICES,
     SETTINGS_PATH,
+    SMOOTHING_WINDOW_RANGE,
+    apply_interface_scale,
     get_cv_data_folder,
     get_data_folder,
+    get_electroanalysis_smoothing,
+    get_interface_scale_percent,
     get_show_electrolysis_plot_after_run,
+    get_show_unconnected_potentiostats,
     set_cv_data_folder,
     set_data_folder,
+    set_electroanalysis_smoothing,
+    set_interface_scale_percent,
     set_show_electrolysis_plot_after_run,
+    set_show_unconnected_potentiostats,
 )
 
 
@@ -38,6 +50,9 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self._build_ui()
         self._load_current_values()
+        # Word-wrapped hints need more height than the dialog's minimum size
+        # hint reports, so size for the wrapped text or it is clipped.
+        self.setMinimumHeight(self.layout().totalHeightForWidth(self.minimumWidth()))
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -69,6 +84,56 @@ class SettingsDialog(QtWidgets.QDialog):
             "Open plot window automatically when an electrolysis run finishes"
         )
         layout.addWidget(self.show_plot_check)
+
+        # --- Devices ---
+        self.show_unconnected_check = QtWidgets.QCheckBox(
+            "Show registered potentiostats that are not plugged in"
+        )
+        self.show_unconnected_check.setToolTip(
+            "In the Electrolysis and Electroanalysis apps, unplugged boards are "
+            "shown greyed out as \u201cNot connected\u201d and cannot be started. "
+            "Takes effect on the next rescan."
+        )
+        layout.addWidget(self.show_unconnected_check)
+
+        # --- Interface scale ---
+        scale_row = QtWidgets.QHBoxLayout()
+        scale_row.addWidget(QtWidgets.QLabel("Interface scale:"))
+        self.scale_combo = QtWidgets.QComboBox()
+        for percent in INTERFACE_SCALE_CHOICES:
+            text = f"{percent}%"
+            if percent == DEFAULT_INTERFACE_SCALE:
+                text += " (system default)"
+            self.scale_combo.addItem(text, percent)
+        self.scale_combo.setToolTip(
+            "Enlarge or shrink every MOLES window, on top of the operating "
+            "system's own display scaling."
+        )
+        scale_row.addWidget(self.scale_combo)
+        scale_row.addStretch(1)
+        layout.addLayout(scale_row)
+        scale_hint = QtWidgets.QLabel(
+            "A new scale applies to MOLES apps opened after saving; reopen any "
+            "that are already open."
+        )
+        scale_hint.setWordWrap(True)
+        scale_hint.setStyleSheet("color: #555;")
+        layout.addWidget(scale_hint)
+
+        # --- Default smoothing ---
+        layout.addWidget(QtWidgets.QLabel(
+            "Default smoothing for electroanalysis data:"))
+        self.smoothing_control = SmoothingControl(
+            max_window=SMOOTHING_WINDOW_RANGE[1])
+        layout.addWidget(self.smoothing_control)
+        smoothing_hint = QtWidgets.QLabel(
+            "New traces in the Data Preview tab and the Data Analysis app start "
+            "with this smoothing; each can still be changed on its own. Saved "
+            "data files are never smoothed."
+        )
+        smoothing_hint.setWordWrap(True)
+        smoothing_hint.setStyleSheet("color: #555;")
+        layout.addWidget(smoothing_hint)
 
         # --- Footer: settings file path + buttons ---
         path_label = QtWidgets.QLabel(f"Settings file: {SETTINGS_PATH}")
@@ -110,6 +175,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.elec_folder_edit.setText(str(get_data_folder()))
         self.cv_folder_edit.setText(str(get_cv_data_folder()))
         self.show_plot_check.setChecked(get_show_electrolysis_plot_after_run())
+        self.show_unconnected_check.setChecked(get_show_unconnected_potentiostats())
+        self.scale_combo.setCurrentIndex(
+            self.scale_combo.findData(get_interface_scale_percent()))
+        self.smoothing_control.set_value(*get_electroanalysis_smoothing())
 
     def _browse_into(self, line_edit: QtWidgets.QLineEdit, fallback: Path) -> None:
         # Start the picker in the currently-displayed folder if it exists,
@@ -139,6 +208,9 @@ class SettingsDialog(QtWidgets.QDialog):
             set_data_folder(Path(elec_text))
             set_cv_data_folder(Path(cv_text))
             set_show_electrolysis_plot_after_run(self.show_plot_check.isChecked())
+            set_show_unconnected_potentiostats(self.show_unconnected_check.isChecked())
+            set_interface_scale_percent(self.scale_combo.currentData())
+            set_electroanalysis_smoothing(*self.smoothing_control.value())
         except OSError as e:
             QtWidgets.QMessageBox.critical(
                 self, "Could not save settings",
@@ -150,6 +222,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
 
 def main() -> None:
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app, "moles.ui.settings")
     install_wheel_guard(app)

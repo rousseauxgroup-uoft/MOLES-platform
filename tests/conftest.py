@@ -30,6 +30,18 @@ def qapp():
 
 
 @pytest.fixture(autouse=True)
+def isolated_settings(tmp_path, monkeypatch):
+    """Point MOLES settings at an empty per-test file.
+
+    Defaults such as the starting smoothing and whether unplugged boards are
+    listed come from the settings file, so tests must not read the real one
+    in the developer's home folder.
+    """
+    from moles import settings
+    monkeypatch.setattr(settings, "SETTINGS_PATH", tmp_path / "moles-settings.json")
+
+
+@pytest.fixture(autouse=True)
 def no_modal_dialogs(request, monkeypatch):
     """In the Data Analysis tests, fail on any dialog a test did not answer itself.
 

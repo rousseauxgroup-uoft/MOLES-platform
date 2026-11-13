@@ -24,6 +24,7 @@ from ...driver.mock import MockPotentiostat
 from ...driver.ps4_ref import Potentiostat
 from ...onboarding import calibration_sweep
 from ...onboarding.discovery import DetectedDevice
+from ...settings import apply_interface_scale
 from ...onboarding.registry import (
     USER_REGISTRY_PATH,
     Entry,
@@ -713,6 +714,7 @@ def _sort_key(name: str) -> int:
 
 
 def main() -> None:
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app, "moles.ui.onboarding")
     install_wheel_guard(app)

@@ -24,6 +24,7 @@ from serial.tools import list_ports
 
 from ... import __version__, claims
 from ...logging_setup import install_qt_message_handler, setup_logging
+from ...settings import apply_interface_scale
 from ...onboarding import firmware
 from ...onboarding.discovery import probe_firmware
 from ...onboarding.registry import load_registry
@@ -608,6 +609,7 @@ def main():
     setup_logging("launcher")
     install_qt_message_handler()
 
+    apply_interface_scale()
     app = QtWidgets.QApplication(sys.argv)
     apply_app_icon(app, "moles.ui.launcher")
     install_wheel_guard(app)

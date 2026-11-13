@@ -557,7 +557,9 @@ def test_smoothing_from_the_card_smooths_the_trace_and_its_labels(panel):
     card = panel._cards[a]
     dataset = panel.store.get("a.csv")
 
-    card.smooth_spin.setValue(25)
+    combo = card.smoothing.method_combo
+    combo.setCurrentIndex(combo.findData("moving_average"))
+    card.smoothing.window_spin.setValue(25)
     _flush(panel)
 
     smoothed = moving_average(dataset.current, 25)
@@ -565,8 +567,13 @@ def test_smoothing_from_the_card_smooths_the_trace_and_its_labels(panel):
     np.testing.assert_allclose(panel._drawn[a].curve.trace_y, smoothed)
     assert panel._drawn[a].labels[0].point[1] == pytest.approx(smoothed[1000])
     assert card.smooth_readout.text().startswith("≈ ") and card.smooth_readout.text().endswith(" mV")
-    card.smooth_spin.setValue(1)
-    assert card.smooth_spin.text() == "Off" and card.smooth_readout.text() == ""
+    combo.setCurrentIndex(combo.findData("savgol"))
+    _flush(panel)
+    from moles.analysis.smoothing import savitzky_golay
+    assert exp.smoothing_method == "savgol"
+    np.testing.assert_allclose(panel._drawn[a].curve.trace_y, savitzky_golay(dataset.current, 25))
+    combo.setCurrentIndex(combo.findData("none"))
+    assert not card.smoothing.window_spin.isEnabled() and card.smooth_readout.text() == ""
 
 
 def _card_order(panel):

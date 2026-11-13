@@ -56,20 +56,20 @@ def test_range_slider_subsets_data(dataset_row):
 def test_smoothing_reduces_noise(dataset_row):
     rng = np.random.default_rng(0)
     dataset_row.y = np.linspace(0, 10, 100) + rng.normal(0, 1.0, 100)
-    dataset_row.smooth_spin.setValue(1)
+    assert dataset_row.smoothing.method() == "none"   # default with no settings saved
     _, raw = dataset_row.rendered_data()
-    dataset_row.smooth_spin.setValue(11)
-    _, smoothed = dataset_row.rendered_data()
-    # A moving average should lower the point-to-point variation.
-    assert np.std(np.diff(smoothed)) < np.std(np.diff(raw))
+    for method in ("moving_average", "savgol"):
+        dataset_row.smoothing.set_value(method, 11)
+        _, smoothed = dataset_row.rendered_data()
+        # Either method should lower the point-to-point variation.
+        assert np.std(np.diff(smoothed)) < np.std(np.diff(raw))
 
 
 def test_smoothing_applies_to_ocp_potential(ocp_row):
     rng = np.random.default_rng(0)
     ocp_row.y = np.linspace(0.30, 0.24, 100) + rng.normal(0, 0.01, 100)
-    ocp_row.smooth_spin.setValue(1)
     _, raw = ocp_row.rendered_data()
-    ocp_row.smooth_spin.setValue(11)
+    ocp_row.smoothing.set_value("moving_average", 11)
     _, smoothed = ocp_row.rendered_data()
     assert np.std(np.diff(smoothed)) < np.std(np.diff(raw))
 
@@ -116,7 +116,7 @@ def test_write_edited_csv_keeps_ocp_columns(ocp_row, tmp_path):
 def test_write_edited_csv_writes_provenance_note(dataset_row, tmp_path):
     dataset_row.name = "demo"
     dataset_row.offset_spin.setValue(0.42)
-    dataset_row.smooth_spin.setValue(5)
+    dataset_row.smoothing.set_value("savgol", 5)
     dataset_row.range_slider.setValues(10, 40)
     out = tmp_path / "demo_edited.csv"
     dataset_row.write_edited_csv(str(out))
@@ -125,7 +125,7 @@ def test_write_edited_csv_writes_provenance_note(dataset_row, tmp_path):
     assert notes.exists()
     text = notes.read_text()
     assert "Offset applied (V): 0.420" in text
-    assert "Smoothing (moving-average window, points): 5" in text
+    assert "Smoothing: Savitzky-Golay, 5 points (polynomial order 2)" in text
     assert "Selected point range (indices): 10 to 40 of 0 to 99" in text
     assert "Points exported: 31" in text
 
